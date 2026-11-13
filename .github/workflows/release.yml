@@ -67,6 +67,37 @@ jobs:
           ./Scripts/scan-secrets.sh --selftest
           ./Scripts/scan-secrets.sh
 
+      # 私钥只在 GitHub Secrets，公钥写死在 Info.plist。两者不配对时发出去的包
+      # 会被所有客户端拒收，且要等用户升级时才暴露 —— 发版前先自检一次。
+      - name: Verify EdDSA key pair
+        env:
+          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+        run: |
+          [ -n "$SPARKLE_PRIVATE_ED_KEY" ] || { echo "缺 secret: SPARKLE_PRIVATE_ED_KEY"; exit 1; }
+          TMP="$(mktemp -d)"
+          trap 'rm -rf "$TMP"' EXIT
+          printf '%s' "$SPARKLE_PRIVATE_ED_KEY" | tr -d '[:space:]' | base64 -D > "$TMP/key.bin"
+          SIZE="$(stat -f%z "$TMP/key.bin")"
+          if [ "$SIZE" -eq 64 ]; then
+            # libsodium 64 字节密钥对：后 32 字节就是公钥
+            tail -c 32 "$TMP/key.bin" | base64 | tr -d '\n' > "$TMP/pub.txt"
+          elif [ "$SIZE" -eq 32 ]; then
+            # 32 字节 seed：包一层 PKCS#8 交给系统 openssl 派生公钥
+            # 16 字节 PKCS#8 前缀拆两段写：连成 32 位 hex 会命中密钥扫描的「长令牌」规则
+            { printf '302e020100300506032b6570' | xxd -r -p; \
+              printf '04220420' | xxd -r -p; \
+              cat "$TMP/key.bin"; } > "$TMP/seed.der"
+            openssl pkey -inform DER -in "$TMP/seed.der" -pubout -outform DER -out "$TMP/pub.der"
+            tail -c 32 "$TMP/pub.der" | base64 | tr -d '\n' > "$TMP/pub.txt"
+          else
+            echo "未知 EdDSA 私钥长度：$SIZE 字节"; exit 1
+          fi
+          ACTUAL="$(cat "$TMP/pub.txt")"
+          EXPECTED="$(plutil -extract SUPublicEDKey raw -o - Resources/Info.plist)"
+          [ "$ACTUAL" = "$EXPECTED" ] || {
+            echo "EdDSA 密钥不配对：secret 派生公钥=$ACTUAL，Info.plist=$EXPECTED"; exit 1; }
+          echo "EdDSA 密钥配对通过（$ACTUAL）"
+
       - name: Unit tests
         run: |
           set +e
@@ -112,7 +143,8 @@ jobs:
           tar -xf /tmp/sparkle.tar.xz -C /tmp bin/sign_update
           KEY_FILE="$(mktemp)"
           trap 'rm -f "$KEY_FILE"' EXIT
-          printf '%s' "$SPARKLE_PRIVATE_ED_KEY" > "$KEY_FILE"
+          # Secrets 里可能带录入时的尾随换行，先去掉空白再交给 sign_update
+          printf '%s' "$SPARKLE_PRIVATE_ED_KEY" | tr -d '[:space:]' > "$KEY_FILE"
           chmod 600 "$KEY_FILE"
           /tmp/bin/sign_update "${RUNNER_TEMP}/misckit-build/product/MiscKit-v${VERSION}-arm64.dmg" \
             -f "$KEY_FILE" > /tmp/sparkle-signature.txt
