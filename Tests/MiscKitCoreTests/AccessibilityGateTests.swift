@@ -29,7 +29,11 @@ struct AccessibilityGateTests {
         prefs.overrideReduceTransparency = true
         #expect(prefs.panelShouldBeOpaque)
         prefs.overrideReduceTransparency = false
-        // 关掉注入点后跟随系统；这里只断言"不再强制"
+        // false 是「强制关闭」而不是「关掉注入点」：此时必须不透明为假，
+        // 且与系统读数无关（CI runner 的「降低透明度」默认开着，旧断言在这里会红）。
+        #expect(!prefs.panelShouldBeOpaque)
+        prefs.overrideReduceTransparency = nil
+        // 真正清空注入点后才回落到系统读数，断言不再依赖运行环境
         #expect(prefs.panelShouldBeOpaque == prefs.reduceTransparency)
     }
 

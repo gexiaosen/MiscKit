@@ -29,7 +29,23 @@ jobs:
 
       - name: Run unit tests
         run: |
-          swift test --arch arm64 --scratch-path "${RUNNER_TEMP:-/tmp}/misckit-build"
+          set +e
+          swift --version 2>&1 | head -2 | tee /tmp/test.log
+          swift test --arch arm64 --scratch-path "${RUNNER_TEMP:-/tmp}/misckit-build" 2>&1 | tee -a /tmp/test.log
+          RC="${PIPESTATUS[0]}"
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            # 与 Release workflow 对齐：Swift Testing 的失败行是
+            # 「✘ Test ... recorded an issue ... Expectation failed」，旧模式只认 XCTest
+            # 的 "Test Case ... failed" 会把唯一失败行漏掉，annotation 恒为空。
+            { grep -E "error: |Expectation failed|recorded an issue|Test Case .* failed|failed \(" /tmp/test.log \
+                | sort -u | head -20; } | while IFS= read -r line; do
+              echo "::error title=UnitTestsFailed::${line}"
+            done
+            echo "===== 日志尾部 40 行 ====="
+            tail -40 /tmp/test.log
+            exit 1
+          fi
 
       - name: Build Debug & Release
         run: |

@@ -52,7 +52,11 @@ jobs:
             echo "首个 Release，无历史 appcast，跳过递增校验"
             exit 0
           fi
-          PREV_BUILD="$(sed -n 's/.*sparkle:version="\([0-9]*\)".*/\1/p' /tmp/prev-appcast.xml | sort -n | tail -1)"
+          # appcast 里 sparkle:version 是元素（<sparkle:version>102</sparkle:version>），
+          # 不是属性；旧模式只认 sparkle:version="..." 会取到空串，递增校验形同虚设。
+          PREV_BUILD="$(sed -n -e 's/.*<sparkle:version>\([0-9]*\)<\/sparkle:version>.*/\1/p' \
+                               -e 's/.*sparkle:version="\([0-9]*\)".*/\1/p' /tmp/prev-appcast.xml \
+                          | sort -n | tail -1)"
           if [ -n "$PREV_BUILD" ] && [ "$BUILD" -le "$PREV_BUILD" ]; then
             echo "CFBundleVersion($BUILD) 必须大于上一版($PREV_BUILD)：bump 后重打 tag"
             exit 1
@@ -71,13 +75,20 @@ jobs:
           RC="${PIPESTATUS[0]}"
           set -e
           if [ "$RC" -ne 0 ]; then
-            # 失败摘要打成 annotation（匿名 API 可见），免登录定位：编译错误 + 挂掉的测试 + 日志尾部
-            { grep -E "error: " /tmp/test.log | head -10; \
-              grep -E "Test Case .* failed|failed \(" /tmp/test.log | sort -u | head -10; } | while IFS= read -r line; do
-              echo "::error title=UnitTestsFailed::${line}"
-            done
-            echo "===== 日志尾部 40 行 ====="
-            tail -40 /tmp/test.log
+            # 失败摘要打成 annotation（匿名 API 可见），免登录定位。
+            # Swift Testing 输出是「✘ Test ... failed after ... / recorded an issue / Expectation failed」，
+            # 旧模式只认 XCTest 的 "Test Case ... failed" 与编译器 "error: "，
+            # 会把唯一的失败行整条漏掉，annotation 于是永远为空。
+            # 用 -A 12 带上下文（issue 详情含期望值/实际值），不只给一行孤零零的失败标题。
+            grep -A 12 -E "✘|error: |Expectation failed|recorded an issue|Test Case .* failed|failed after" /tmp/test.log \
+                | head -100 > /tmp/fail-summary.txt || true
+            n=0
+            while IFS= read -r line; do
+              trimmed="$(printf '%s' "$line" | tr -d '\r' | cut -c1-240)"
+              [ -z "$trimmed" ] && continue
+              n=$((n + 1)); [ "$n" -gt 14 ] && break
+              echo "::error title=TestFail-${n}::${trimmed}"
+            done < /tmp/fail-summary.txt
             exit 1
           fi
 
