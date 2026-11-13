@@ -154,10 +154,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Release 正文统一取自 CHANGELOG.md 对应版本段落：首个版本写全功能，
+          # 后续版本只追加变化。不再用 --generate-notes（只有 commit 列表）。
+          ./Scripts/release-notes.sh "$VERSION" > /tmp/release-notes.md
           gh release create "$GITHUB_REF_NAME" \
             "${RUNNER_TEMP}/misckit-build/product/MiscKit-v${VERSION}-arm64.dmg" \
             --title "MiscKit ${VERSION}" \
-            --generate-notes \
+            --notes-file /tmp/release-notes.md \
             --latest
 
       # appcast 的 SUFeedURL 指向 releases/latest/download/appcast.xml，
@@ -170,11 +173,11 @@ jobs:
           DMG_PATH="${RUNNER_TEMP}/misckit-build/product/${DMG_NAME}"
           DMG_SIZE="$(stat -f%z "$DMG_PATH")"
           SIG="$(cat /tmp/sparkle-signature.txt)"
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq .body > /tmp/release-notes.md
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq .body > /tmp/appcast-notes.md
           python3 - "$VERSION" "$BUILD" "$GITHUB_REPOSITORY" "$DMG_NAME" "$DMG_SIZE" "$SIG" <<'PYEOF'
           import sys
           version, build, repo, dmg_name, dmg_size, sig = sys.argv[1:7]
-          notes = open('/tmp/release-notes.md').read().replace(']]>', ']]&gt;')
+          notes = open('/tmp/appcast-notes.md').read().replace(']]>', ']]&gt;')
           pub_date = __import__('datetime').datetime.now(__import__('datetime').timezone.utc).strftime('%a, %d %b %Y %H:%M:%S +0000')
           appcast = f'''<?xml version="1.0" encoding="utf-8" standalone="no"?>
           <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0">

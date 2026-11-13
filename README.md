@@ -104,7 +104,8 @@ swift test  --arch arm64 --scratch-path "$HOME/.cache/misckit-build"
 ### Releasing (maintainers)
 
 1. Bump `CFBundleShortVersionString` and `CFBundleVersion` (numeric, strictly increasing) in `Resources/Info.plist`.
-2. Commit, then `git tag vX.Y.Z && git push --tags`.
+2. Add a `## [X.Y.Z]` section at the top of `CHANGELOG.md` describing what changed since the previous release. This section becomes the GitHub Release notes verbatim — the first release documents every feature, later ones only the delta.
+3. Commit, then `git tag vX.Y.Z && git push --tags`.
 
 CI then runs the secret scan, tests, packages the `.dmg` (ad-hoc signed), signs it with the EdDSA key stored in repo secrets, creates the GitHub Release and uploads `appcast.xml` — existing installs pick it up on their next daily check.
 
@@ -203,7 +204,8 @@ make install                    # 打包 Release → 干净退出旧实例 → �
 ### 发布流程（维护者）
 
 1. 同步递增 `Resources/Info.plist` 中的 `CFBundleShortVersionString` 与 `CFBundleVersion`（纯数字，严格递增）。
-2. 提交后 `git tag vX.Y.Z && git push --tags`。
+2. 在 `CHANGELOG.md` 顶部追加 `## [X.Y.Z]` 段落，写本次相对上一版的变化；该段落会原样成为 GitHub Release 的更新说明。首个版本写全功能，后续版本只写增量。
+3. 提交后 `git tag vX.Y.Z && git push --tags`。
 
 CI 会依次执行密钥扫描、测试、打 dmg（ad-hoc 签名）、用仓库 Secrets 里的 EdDSA 私钥签名、创建 GitHub Release 并上传 `appcast.xml`；存量用户在下一轮每日检查时自动发现新版本。
 
