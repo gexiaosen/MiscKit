@@ -19,7 +19,10 @@ env:
 jobs:
   release:
     name: Package & Publish (macOS arm64)
-    runs-on: macos-26
+    # Package.swift 声明 swift-tools-version 6.2，需要 Xcode 27（Swift 6.2）工具链；
+    # macos-26 镜像最高 Xcode 26.6（Swift 6.1）会在包清单解析时直接失败。
+    # xcode-27 镜像目前是 preview，与本地开发环境（Xcode 27.2）一致。
+    runs-on: xcode-27
     timeout-minutes: 30
     steps:
       - name: Checkout
