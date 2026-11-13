@@ -66,15 +66,18 @@ jobs:
       - name: Unit tests
         run: |
           set +e
-          swift test --arch arm64 --scratch-path "${RUNNER_TEMP}/misckit-build" 2>&1 | tee /tmp/test.log
+          swift --version 2>&1 | head -2 | tee /tmp/test.log
+          swift test --arch arm64 --scratch-path "${RUNNER_TEMP}/misckit-build" 2>&1 | tee -a /tmp/test.log
           RC="${PIPESTATUS[0]}"
           set -e
           if [ "$RC" -ne 0 ]; then
-            # 失败摘要打成 annotation（匿名 API 可见），免登录定位挂掉的测试
-            grep -E "Test Case .* failed|error: -\[|failed \(" /tmp/test.log | sort -u | head -15 | while IFS= read -r line; do
+            # 失败摘要打成 annotation（匿名 API 可见），免登录定位：编译错误 + 挂掉的测试 + 日志尾部
+            { grep -E "error: " /tmp/test.log | head -10; \
+              grep -E "Test Case .* failed|failed \(" /tmp/test.log | sort -u | head -10; } | while IFS= read -r line; do
               echo "::error title=UnitTestsFailed::${line}"
             done
-            grep -A6 "Test Case .* failed" /tmp/test.log | head -40 || true
+            echo "===== 日志尾部 40 行 ====="
+            tail -40 /tmp/test.log
             exit 1
           fi
 
