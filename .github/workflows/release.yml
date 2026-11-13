@@ -1,0 +1,147 @@
+name: Release
+
+# 推 tag 即全自动出包发布：
+#   git tag v0.9.74 && git push --tags
+# 链路：tag↔plist 校验 → build 递增校验 → 密钥扫描 → 单测 → ad-hoc 出包 → dmg
+#      → EdDSA 签名（secrets 私钥）→ 建 Release → 生成 appcast 回传。
+# 全程不需要任何 Apple 证书：Sparkle 2 走 EdDSA 通道，ad-hoc 签名包可正常自动更新。
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+env:
+  SPARKLE_VERSION: '2.10.1'
+  SPARKLE_DIST: 'https://github.com/sparkle-project/Sparkle/releases/download'
+
+jobs:
+  release:
+    name: Package & Publish (macOS arm64)
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 发布纪律：tag 与 Info.plist 必须严格同步，否则 Sparkle 客户端的
+      # 版本比较就失去了事实来源；build 号是 Sparkle 的排序键，必须纯数字。
+      - name: Verify tag matches Info.plist
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          PLIST_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - Resources/Info.plist)"
+          BUILD="$(plutil -extract CFBundleVersion raw -o - Resources/Info.plist)"
+          [ "$VERSION" = "$PLIST_VERSION" ] || { echo "tag($VERSION) 与 Info.plist($PLIST_VERSION) 不一致，先同步再打 tag"; exit 1; }
+          [[ "$BUILD" =~ ^[0-9]+$ ]] || { echo "CFBundleVersion 必须是纯数字: $BUILD"; exit 1; }
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "BUILD=$BUILD" >> "$GITHUB_ENV"
+
+      # Sparkle 按 CFBundleVersion 排序；不递增等于发了"旧版本"，客户端会拒绝更新。
+      - name: Verify build number increments
+        run: |
+          set +e
+          curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/appcast.xml" -o /tmp/prev-appcast.xml 2>/dev/null
+          RC=$?
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            echo "首个 Release，无历史 appcast，跳过递增校验"
+            exit 0
+          fi
+          PREV_BUILD="$(sed -n 's/.*sparkle:version="\([0-9]*\)".*/\1/p' /tmp/prev-appcast.xml | sort -n | tail -1)"
+          if [ -n "$PREV_BUILD" ] && [ "$BUILD" -le "$PREV_BUILD" ]; then
+            echo "CFBundleVersion($BUILD) 必须大于上一版($PREV_BUILD)：bump 后重打 tag"
+            exit 1
+          fi
+
+      - name: Secret scan self-test & repository scan
+        run: |
+          ./Scripts/scan-secrets.sh --selftest
+          ./Scripts/scan-secrets.sh
+
+      - name: Unit tests
+        run: swift test --arch arm64 --scratch-path "${RUNNER_TEMP}/misckit-build"
+
+      - name: Package .app (ad-hoc)
+        run: MISCKIT_SCRATCH="${RUNNER_TEMP}/misckit-build" ./Scripts/make-app.sh release
+
+      - name: Package .dmg
+        run: |
+          ./Scripts/make-dmg.sh \
+            "${RUNNER_TEMP}/misckit-build/product/MiscKit.app" \
+            "${RUNNER_TEMP}/misckit-build/product/MiscKit-v${VERSION}-arm64.dmg"
+
+      # EdDSA 私钥只存在于 GitHub Secrets：泄露面仅限更新通道签名，
+      # 与 Apple 证书无关。sign_update 输出的 edSignature+length 直接进 appcast。
+      - name: Sign dmg with Sparkle EdDSA key
+        env:
+          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+        run: |
+          [ -n "$SPARKLE_PRIVATE_ED_KEY" ] || { echo "缺 secret: SPARKLE_PRIVATE_ED_KEY（generate_keys -x 导出后录入）"; exit 1; }
+          curl -fsSL -o /tmp/sparkle.tar.xz "${SPARKLE_DIST}/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+          tar -xf /tmp/sparkle.tar.xz -C /tmp bin/sign_update
+          KEY_FILE="$(mktemp)"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          printf '%s' "$SPARKLE_PRIVATE_ED_KEY" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          /tmp/bin/sign_update "${RUNNER_TEMP}/misckit-build/product/MiscKit-v${VERSION}-arm64.dmg" \
+            -f "$KEY_FILE" > /tmp/sparkle-signature.txt
+          cat /tmp/sparkle-signature.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "${RUNNER_TEMP}/misckit-build/product/MiscKit-v${VERSION}-arm64.dmg" \
+            --title "MiscKit ${VERSION}" \
+            --generate-notes \
+            --latest
+
+      # appcast 的 SUFeedURL 指向 releases/latest/download/appcast.xml，
+      # 每次发版覆盖同 asset 名，客户端永远拿到最新一条目。
+      - name: Generate & upload appcast.xml
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DMG_NAME="MiscKit-v${VERSION}-arm64.dmg"
+          DMG_PATH="${RUNNER_TEMP}/misckit-build/product/${DMG_NAME}"
+          DMG_SIZE="$(stat -f%z "$DMG_PATH")"
+          SIG="$(cat /tmp/sparkle-signature.txt)"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq .body > /tmp/release-notes.md
+          python3 - "$VERSION" "$BUILD" "$GITHUB_REPOSITORY" "$DMG_NAME" "$DMG_SIZE" "$SIG" <<'PYEOF'
+          import sys
+          version, build, repo, dmg_name, dmg_size, sig = sys.argv[1:7]
+          notes = open('/tmp/release-notes.md').read().replace(']]>', ']]&gt;')
+          pub_date = __import__('datetime').datetime.now(__import__('datetime').timezone.utc).strftime('%a, %d %b %Y %H:%M:%S +0000')
+          appcast = f'''<?xml version="1.0" encoding="utf-8" standalone="no"?>
+          <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0">
+            <channel>
+              <title>MiscKit</title>
+              <link>https://github.com/{repo}/releases/latest/download/appcast.xml</link>
+              <description>Most recent changes</description>
+              <language>en</language>
+              <item>
+                <title>MiscKit {version}</title>
+                <pubDate>{pub_date}</pubDate>
+                <sparkle:version>{build}</sparkle:version>
+                <sparkle:shortVersionString>{version}</sparkle:shortVersionString>
+                <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+                <enclosure
+                  url="https://github.com/{repo}/releases/download/v{version}/{dmg_name}"
+                  {sig}
+                  type="application/x-apple-diskimage"
+                />
+                <description><![CDATA[{notes}]]></description>
+              </item>
+            </channel>
+          </rss>
+          '''
+          with open('/tmp/appcast.xml', 'w') as f:
+              f.write(appcast)
+          PYEOF
+          python3 -c "import xml.dom.minidom; xml.dom.minidom.parse('/tmp/appcast.xml')" \
+            && echo "appcast XML 校验通过"
+          gh release upload "$GITHUB_REF_NAME" /tmp/appcast.xml --clobber
+          echo "✅ 发布完成：Sparkle 客户端将于每日静默检查时发现 ${VERSION}"

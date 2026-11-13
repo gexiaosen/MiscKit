@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  verify:
+    name: Build, Test & Secret Scan (macOS arm64)
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check architecture & Xcode
+        run: |
+          uname -m
+          sw_vers
+          swift --version
+          xcodebuild -version || true
+
+      - name: Secret scan self-test & repository scan
+        run: |
+          ./Scripts/scan-secrets.sh --selftest
+          ./Scripts/scan-secrets.sh
+
+      - name: Run unit tests
+        run: |
+          swift test --arch arm64 --scratch-path "${RUNNER_TEMP:-/tmp}/misckit-build"
+
+      - name: Build Debug & Release
+        run: |
+          swift build -c debug --arch arm64 --scratch-path "${RUNNER_TEMP:-/tmp}/misckit-build"
+          swift build -c release --arch arm64 --scratch-path "${RUNNER_TEMP:-/tmp}/misckit-build"
+
+      - name: Package .app & verify signature and resource bundle
+        run: |
+          MISCKIT_SCRATCH="${RUNNER_TEMP:-/tmp}/misckit-build" ./Scripts/make-app.sh release
+          APP="${RUNNER_TEMP:-/tmp}/misckit-build/product/MiscKit.app"
+          codesign --verify --deep --strict "$APP"
+          test -d "$APP/Contents/Resources/MiscKit_MiscKitCore.bundle"
