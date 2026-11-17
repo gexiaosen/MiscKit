@@ -18,9 +18,18 @@ struct FileIndexEntry: Equatable, Sendable {
     init(path: String, name: String, isDirectory: Bool, ext: String, kind: String,
          size: Int64? = nil, modified: Date? = nil, created: Date? = nil,
          lastUsed: Date? = nil) {
+        self.init(path: path, name: name, nameFolded: FileIndexText.fold(name),
+                  isDirectory: isDirectory, ext: ext, kind: kind,
+                  size: size, modified: modified, created: created, lastUsed: lastUsed)
+    }
+
+    /// 从库里读出来的行已经存过 `name_folded`，别再跑一遍 ICU 折叠：一次查询 80 行，
+    /// 每行一次 `precomposedStringWithCanonicalMapping` + `folding` 是白扔的几十毫秒。
+    init(path: String, name: String, nameFolded: String, isDirectory: Bool, ext: String,
+         kind: String, size: Int64?, modified: Date?, created: Date?, lastUsed: Date?) {
         self.path = path
         self.name = name
-        self.nameFolded = FileIndexText.fold(name)
+        self.nameFolded = nameFolded
         self.ext = ext
         self.kind = kind
         self.isDirectory = isDirectory
@@ -29,6 +38,14 @@ struct FileIndexEntry: Equatable, Sendable {
         self.created = created
         self.lastUsed = lastUsed
     }
+}
+
+/// 一次查询的产出。`total` 命中计数上限（见 `FileIndexDatabase.countCap`）时只是下界，
+/// 这时 `totalIsExact` 为假：宁可显示「1000+」，也不要为了一个精确数字再全表扫一遍。
+struct FileIndexQueryResult: Sendable {
+    let entries: [FileIndexEntry]
+    let total: Int
+    let totalIsExact: Bool
 }
 
 struct FileIndexQuery: Sendable {
@@ -57,13 +74,19 @@ enum FileIndexError: LocalizedError, Equatable {
 // MARK: - SQLite 封装
 
 /// 所有 SQL 都在这个 actor 上串行执行；扫描批次、查询和增量更新共用一条连接。
+///
+/// `readOnly` 为真时是查询专用连接：同一份库上的第二条连接，只读、只跑 SELECT。
+/// 它存在的唯一理由是让查询不必排在增量更新/子树重扫后面——一个 actor 一条连接时，
+/// 一次目录重扫能把每一次按键的查询堵住一两秒（对外表现就是"搜索偶尔卡住"）。
 actor FileIndexDatabase {
     private let url: URL
+    private let readOnly: Bool
     // 连接只在 actor 内使用；deinit 需要关闭它，而 deinit 是非隔离的。
     nonisolated(unsafe) private var db: OpaquePointer?
 
-    init(url: URL) {
+    init(url: URL, readOnly: Bool = false) {
         self.url = url
+        self.readOnly = readOnly
     }
 
     deinit {
@@ -74,10 +97,14 @@ actor FileIndexDatabase {
 
     func open() throws {
         guard db == nil else { return }
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
-                                                withIntermediateDirectories: true)
+        if !readOnly {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+        }
         var handle: OpaquePointer?
-        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
+        let flags = SQLITE_OPEN_READWRITE
+            | (readOnly ? 0 : SQLITE_OPEN_CREATE)
+            | SQLITE_OPEN_FULLMUTEX
         guard sqlite3_open_v2(url.path, &handle, flags, nil) == SQLITE_OK, let handle else {
             let message = handle.map { String(cString: sqlite3_errmsg($0)) } ?? "unknown"
             if let handle { sqlite3_close_v2(handle) }
@@ -85,6 +112,15 @@ actor FileIndexDatabase {
         }
         db = handle
         sqlite3_busy_timeout(handle, 4000)
+        if readOnly {
+            // 只读连接自己不做 checkpoint，页缓存与 mmap 归它自己：
+            // 38 万行、800MB 的库靠 read() 逐页取，冷页就是几十毫秒起步。
+            try execute("PRAGMA query_only=1")
+            try execute("PRAGMA mmap_size=\(256 * 1024 * 1024)")
+            try execute("PRAGMA cache_size=\(-32 * 1024)")
+            try execute("PRAGMA temp_store=MEMORY")
+            return
+        }
         try execute("PRAGMA journal_mode=WAL")
         try execute("PRAGMA synchronous=NORMAL")
         try execute("PRAGMA temp_store=MEMORY")
@@ -454,152 +490,235 @@ actor FileIndexDatabase {
         }
     }
 
-    func query(_ query: FileIndexQuery) throws -> (entries: [FileIndexEntry], total: Int) {
+    // MARK: 查询
+
+    /// 命中计数的上限：超过它就只报「这么多」而不追求精确。
+    /// 一个 38 万行的库上，精确总数意味着每次按键都要多扫一遍全表，
+    /// 而用户真正需要的信息只是「还有很多，先给你 80 条」。
+    nonisolated static let countCap = 1000
+
+    /// 查询计划分成三类子句：基础过滤（类型/范围/扩展名）、词过滤、排序。
+    /// `whereSQL` 与 `values` 必须按 append 顺序成对使用。
+    private struct Filter {
         var clauses: [String] = []
         var values: [SQLValue] = []
 
-        if query.syntax.folderOnly {
-            clauses.append("is_directory = 1")
+        var whereSQL: String { clauses.isEmpty ? "1 = 1" : clauses.joined(separator: " AND ") }
+
+        mutating func merge(_ other: Filter) {
+            clauses.append(contentsOf: other.clauses)
+            values.append(contentsOf: other.values)
         }
-        if query.syntax.fileOnly {
-            clauses.append("is_directory = 0")
+
+        mutating func append(_ clause: String, _ values: [SQLValue] = []) {
+            clauses.append(clause)
+            self.values.append(contentsOf: values)
         }
+    }
+
+    func query(_ query: FileIndexQuery) throws -> FileIndexQueryResult {
+        let limit = max(query.limit, 0)
+        let base = baseFilter(query)
+        let rankingIndex = query.syntax.terms.firstIndex { !$0.isNegated }
+
+        guard limit > 0 else {
+            let count = try cappedCount(fullFilter(query))
+            return FileIndexQueryResult(entries: [], total: count.count,
+                                        totalIsExact: count.exact)
+        }
+
+        // 相关度排序走「分段取」：完全相等 → 前缀 → 其余，三段合起来正好覆盖全部命中，
+        // 段内按名字序。每段都顺着 `name_folded` 索引走、凑够 limit+1 就停，
+        // 不再对全部命中做 CASE 排序 + 临时 B 树 + 计数（实测 251ms → 个位数）。
+        if query.sort == .relevance,
+           let rankingIndex,
+           case let first = query.syntax.terms[rankingIndex],
+           !first.text.isEmpty, !first.hasWildcard {
+            let folded = FileIndexText.fold(first.text)
+            let rest = termFilter(query, skipping: rankingIndex)
+            var seen = Set<String>()
+            var collected: [FileIndexEntry] = []
+            var exhausted = true
+            for group in Self.rankingGroups(folded: folded) {
+                if collected.count > limit { break }
+                var filter = base
+                filter.merge(rest)
+                filter.append(group.clause, group.values)
+                let rows = try select(filter, order: "name_folded ASC", limit: limit + 1)
+                if rows.count > limit { exhausted = false }
+                for row in rows where seen.insert(row.path).inserted {
+                    collected.append(row)
+                }
+            }
+            return try finish(collected, limit: limit, filter: fullFilter(query),
+                              exhausted: exhausted)
+        }
+
+        // 其余排序都与表达式索引同式：顺着索引取前 limit+1 条即可，不必先数总数。
+        let order: String
+        switch query.sort {
+        case .relevance, .name:
+            // 没有可分段的正向词（只有排除词 / 通配词）时退回名字序。
+            order = "name_folded ASC"
+        case .modified:
+            order = "COALESCE(modified, 0) DESC, name_folded ASC"
+        case .created:
+            order = "COALESCE(created, 0) DESC, name_folded ASC"
+        case .size:
+            order = "COALESCE(size, 0) DESC, name_folded ASC"
+        }
+        var filter = base
+        filter.merge(termFilter(query, skipping: nil))
+        let rows = try select(filter, order: order, limit: limit + 1)
+        return try finish(rows, limit: limit, filter: fullFilter(query),
+                          exhausted: rows.count <= limit)
+    }
+
+    /// 三段排序子句：`name_folded` 上的等值、前缀、包含。前两段能吃索引范围，
+    /// 第三段顺着索引扫、命中够了就停（`LIMIT` 会把扫描截断）。
+    private static func rankingGroups(folded: String) -> [(clause: String, values: [SQLValue])] {
+        [
+            ("name_folded = ?", [.text(folded)]),
+            ("name_folded LIKE ? ESCAPE '\\'", [.text(FileIndexText.escapeLike(folded) + "%")]),
+            ("name_folded LIKE ? ESCAPE '\\'", [.text("%" + FileIndexText.escapeLike(folded) + "%")]),
+        ]
+    }
+
+    /// 截断判定与总数：取到的行没到 limit 说明已经翻到底，总数就是行数；
+    /// 到顶了才去数一遍（有上限，见 `countCap`）。
+    private func finish(_ rows: [FileIndexEntry], limit: Int, filter: Filter,
+                        exhausted: Bool) throws -> FileIndexQueryResult {
+        let items = Array(rows.prefix(limit))
+        guard !exhausted else {
+            return FileIndexQueryResult(entries: items, total: items.count, totalIsExact: true)
+        }
+        let count = try cappedCount(filter)
+        return FileIndexQueryResult(entries: items, total: count.count,
+                                    totalIsExact: count.exact)
+    }
+
+    /// 分类 / 范围 / `folder:` `file:` / `ext:` 这些与词无关的过滤。
+    private func baseFilter(_ query: FileIndexQuery) -> Filter {
+        var filter = Filter()
+        if query.syntax.folderOnly { filter.append("is_directory = 1") }
+        if query.syntax.fileOnly { filter.append("is_directory = 0") }
         if !query.syntax.extensions.isEmpty {
             let placeholders = Array(repeating: "?", count: query.syntax.extensions.count)
                 .joined(separator: ",")
-            clauses.append("ext IN (\(placeholders))")
-            values.append(contentsOf: query.syntax.extensions.map { .text($0) })
+            filter.append("ext IN (\(placeholders))",
+                          query.syntax.extensions.map { .text($0) })
         }
 
         switch query.category {
         case .all:
             break
         case .folder:
-            clauses.append("is_directory = 1")
+            filter.append("is_directory = 1")
         default:
-            clauses.append("kind = ?")
-            values.append(.text(query.category.rawValue))
+            filter.append("kind = ?", [.text(query.category.rawValue)])
         }
 
-        switch query.scope {
-        case .mac:
-            break
-        case .folders:
+        if query.scope == .folders {
             let directories = query.directories.isEmpty
                 ? [FileManager.default.homeDirectoryForCurrentUser]
                 : query.directories
             var scopes: [String] = []
+            var values: [SQLValue] = []
             for directory in directories {
                 let path = Self.cleanPath(directory.path)
-                scopes.append("(path = ? OR path LIKE ? ESCAPE '\\')")
+                // 子树判定用 path 区间而不是 LIKE：`path` 上有 UNIQUE 索引，
+                // 区间能顺着索引走，LIKE 'x/%' 只能逐行比对。
+                scopes.append("(path = ? OR (path >= ? AND path < ?))")
                 values.append(.text(path))
-                values.append(.text(FileIndexText.escapeLike(path) + "/%"))
+                values.append(.text(path + "/"))
+                values.append(.text(path + "0"))
             }
-            clauses.append("(" + scopes.joined(separator: " OR ") + ")")
+            filter.append("(" + scopes.joined(separator: " OR ") + ")", values)
         }
+        return filter
+    }
 
-        for term in query.syntax.terms {
+    /// 全部词的过滤；`skipping` 用于分段取时把排序那一个词换成段子句。
+    private func termFilter(_ query: FileIndexQuery, skipping: Int?) -> Filter {
+        var filter = Filter()
+        for (index, term) in query.syntax.terms.enumerated() where index != skipping {
             let pattern = FileSearchSyntax.likePattern(for: term)
-            clauses.append(term.isNegated
+            filter.append(term.isNegated
                 ? "name_folded NOT LIKE ? ESCAPE '\\'"
-                : "name_folded LIKE ? ESCAPE '\\'")
-            values.append(.text(pattern))
+                : "name_folded LIKE ? ESCAPE '\\'",
+                [.text(pattern)])
         }
+        return filter
+    }
 
-        let whereSQL = clauses.isEmpty ? "1 = 1" : clauses.joined(separator: " AND ")
+    private func fullFilter(_ query: FileIndexQuery) -> Filter {
+        var filter = baseFilter(query)
+        filter.merge(termFilter(query, skipping: nil))
+        return filter
+    }
 
-        var orderSQL = "name_folded ASC"
-        var orderValues: [SQLValue] = []
-        // CASE 排序（相关度）没有对应的表达式索引；其余排序都与索引同式。
-        var sortCanUseIndex = true
-        switch query.sort {
-        case .relevance:
-            if let first = query.syntax.positiveTerms.first, !first.text.isEmpty {
-                if first.hasWildcard {
-                    orderSQL = "name_folded ASC"
-                } else {
-                    let folded = FileIndexText.fold(first.text)
-                    orderSQL = """
-                    CASE
-                        WHEN name_folded = ? THEN 0
-                        WHEN name_folded LIKE ? ESCAPE '\\' THEN 1
-                        ELSE 2
-                    END, name_folded ASC
-                    """
-                    orderValues.append(.text(folded))
-                    orderValues.append(.text(FileIndexText.escapeLike(folded) + "%"))
-                    sortCanUseIndex = false
-                }
-            }
-        case .modified:
-            orderSQL = "COALESCE(modified, 0) DESC, name_folded ASC"
-        case .created:
-            orderSQL = "COALESCE(created, 0) DESC, name_folded ASC"
-        case .name:
-            orderSQL = "name_folded ASC"
-        case .size:
-            orderSQL = "COALESCE(size, 0) DESC, name_folded ASC"
-        }
-
-        let limit = max(query.limit, 0)
-        // 排序能走索引时，总数交给标量子查询（覆盖索引），结果按索引顺序取前 N 条：
-        // 实测 38.5 万行空查询 293ms→5ms、宽词 138ms→21ms。不能走索引的 relevance CASE
-        // 仍用窗口函数，避免两次全扫。
-        let sql: String
-        if sortCanUseIndex {
-            sql = """
-            SELECT path, name, is_directory, ext, kind, size, modified, created, last_used,
-                   (SELECT COUNT(*) FROM entries WHERE \(whereSQL)) AS total
-            FROM entries
-            WHERE \(whereSQL)
-            ORDER BY \(orderSQL)
-            LIMIT ?
-            """
-        } else {
-            sql = """
-            SELECT path, name, is_directory, ext, kind, size, modified, created, last_used,
-                   COUNT(*) OVER ()
-            FROM entries
-            WHERE \(whereSQL)
-            ORDER BY \(orderSQL)
-            LIMIT ?
-            """
-        }
+    private func select(_ filter: Filter, order: String, limit: Int) throws -> [FileIndexEntry] {
+        let sql = """
+        SELECT path, name, name_folded, is_directory, ext, kind, size, modified, created, last_used
+        FROM \(Self.liveTable)
+        WHERE \(filter.whereSQL)
+        ORDER BY \(order)
+        LIMIT ?
+        """
         let statement = try prepare(sql)
         defer { sqlite3_finalize(statement) }
-        var bindIndex: Int32 = 1
-        // 标量子查询在 SELECT 列表里，它的 WHERE 占位符排在外部 WHERE 之前。
-        let bindValues = sortCanUseIndex ? values + values + orderValues : values + orderValues
-        for value in bindValues {
-            try bind(value, to: statement, at: bindIndex)
-            bindIndex += 1
+        var index: Int32 = 1
+        for value in filter.values {
+            try bind(value, to: statement, at: index)
+            index += 1
         }
-        sqlite3_bind_int64(statement, bindIndex, Int64(limit))
+        sqlite3_bind_int64(statement, index, Int64(max(limit, 0)))
 
         var entries: [FileIndexEntry] = []
-        entries.reserveCapacity(limit)
-        var total = 0
+        entries.reserveCapacity(max(limit, 0))
         while sqlite3_step(statement) == SQLITE_ROW {
-            let path = columnText(statement, 0)
-            let name = columnText(statement, 1)
-            let isDirectory = sqlite3_column_int(statement, 2) != 0
-            let ext = columnText(statement, 3)
-            let kind = columnText(statement, 4)
-            let size = sqlite3_column_type(statement, 5) == SQLITE_NULL
-                ? nil : sqlite3_column_int64(statement, 5)
-            let modified = sqlite3_column_type(statement, 6) == SQLITE_NULL
-                ? nil : Date(timeIntervalSince1970: sqlite3_column_double(statement, 6))
-            let created = sqlite3_column_type(statement, 7) == SQLITE_NULL
-                ? nil : Date(timeIntervalSince1970: sqlite3_column_double(statement, 7))
-            let lastUsed = sqlite3_column_type(statement, 8) == SQLITE_NULL
-                ? nil : Date(timeIntervalSince1970: sqlite3_column_double(statement, 8))
-            total = Int(sqlite3_column_int64(statement, 9))
-            entries.append(FileIndexEntry(path: path, name: name, isDirectory: isDirectory,
-                                          ext: ext, kind: kind, size: size,
-                                          modified: modified, created: created,
-                                          lastUsed: lastUsed))
+            entries.append(entryFromRow(statement))
         }
-        return (entries, total)
+        return entries
+    }
+
+    /// 数命中，但最多数到 `countCap + 1` 就停：索引扫到第 1001 个命中即收手。
+    private func cappedCount(_ filter: Filter) throws -> (count: Int, exact: Bool) {
+        let sql = """
+        SELECT COUNT(*) FROM (
+            SELECT 1 FROM \(Self.liveTable) WHERE \(filter.whereSQL) LIMIT ?
+        )
+        """
+        let statement = try prepare(sql)
+        defer { sqlite3_finalize(statement) }
+        var index: Int32 = 1
+        for value in filter.values {
+            try bind(value, to: statement, at: index)
+            index += 1
+        }
+        sqlite3_bind_int64(statement, index, Int64(Self.countCap + 1))
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw currentError() }
+        let value = Int(sqlite3_column_int64(statement, 0))
+        return value > Self.countCap ? (Self.countCap, false) : (value, true)
+    }
+
+    private func entryFromRow(_ statement: OpaquePointer) -> FileIndexEntry {
+        let size = sqlite3_column_type(statement, 6) == SQLITE_NULL
+            ? nil : sqlite3_column_int64(statement, 6)
+        let modified = sqlite3_column_type(statement, 7) == SQLITE_NULL
+            ? nil : Date(timeIntervalSince1970: sqlite3_column_double(statement, 7))
+        let created = sqlite3_column_type(statement, 8) == SQLITE_NULL
+            ? nil : Date(timeIntervalSince1970: sqlite3_column_double(statement, 8))
+        let lastUsed = sqlite3_column_type(statement, 9) == SQLITE_NULL
+            ? nil : Date(timeIntervalSince1970: sqlite3_column_double(statement, 9))
+        return FileIndexEntry(path: columnText(statement, 0),
+                              name: columnText(statement, 1),
+                              nameFolded: columnText(statement, 2),
+                              isDirectory: sqlite3_column_int(statement, 3) != 0,
+                              ext: columnText(statement, 4),
+                              kind: columnText(statement, 5),
+                              size: size, modified: modified,
+                              created: created, lastUsed: lastUsed)
     }
 
     // MARK: 绑定与错误

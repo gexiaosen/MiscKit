@@ -530,6 +530,10 @@ public enum L10n {
             public static func truncated(_ count: Int, _ shown: Int) -> String {
                 L10n.format("files.count.truncated", Int64(count), Int64(shown))
             }
+            /// 命中数封顶时的说法：`count` 是下界，不是精确值。
+            public static func many(_ count: Int, _ shown: Int) -> String {
+                L10n.format("files.count.many", Int64(count), Int64(shown))
+            }
         }
 
         public enum DB {

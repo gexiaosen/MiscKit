@@ -10,6 +10,8 @@ final class FileSearchModel {
     private(set) var items: [FileItem] = []
     private(set) var total = 0
     private(set) var isTruncated = false
+    /// 索引给的总数被封顶时只作下界用，底栏说「1000+」而不是一个假精确值。
+    private(set) var totalIsExact = true
     private(set) var notice: String?
     /// 删除这类动作的结果另占一格：`notice` 每次查询都会被服务端覆盖，混进去就是一条闪没的提示。
     private(set) var actionNotice: String?
@@ -108,8 +110,10 @@ final class FileSearchModel {
         actionNotice = nil
         selection = 0
         clearMultiSelection()
-        service.prewarmSpotlightAvailability()
-        schedule(delay: isKeywordSearch() ? .milliseconds(130) : .zero)
+        // 索引就绪时查询走 SQLite，Spotlight 探针纯属白烧 I/O：
+        // 它扫的是整盘 `Applications`，一次 1.5 秒上限，正好和按键抢磁盘。
+        if !FileIndex.shared.isReady { service.prewarmSpotlightAvailability() }
+        schedule(delay: isKeywordSearch() ? .milliseconds(90) : .zero)
     }
 
     func deactivate() {
@@ -304,7 +308,10 @@ final class FileSearchModel {
     }
 
     var countText: String {
-        isTruncated ? L10n.Files.Count.truncated(total, items.count) : L10n.Files.Count.exact(total)
+        guard isTruncated else { return L10n.Files.Count.exact(total) }
+        return totalIsExact
+            ? L10n.Files.Count.truncated(total, items.count)
+            : L10n.Files.Count.many(total, items.count)
     }
 
     var highlightTerm: String? {
@@ -350,6 +357,7 @@ final class FileSearchModel {
         items = response.items
         total = response.total
         isTruncated = response.isTruncated
+        totalIsExact = response.totalIsExact
         notice = response.notice
         isSearching = false
         selection = min(selection, max(items.count - 1, 0))

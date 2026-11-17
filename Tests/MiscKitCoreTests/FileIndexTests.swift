@@ -146,6 +146,56 @@ struct FileIndexTests {
         #expect(scopedByModified.entries.first?.name == "报价.pdf")
     }
 
+    @Test("SQLite：相关度按「相等→前缀→包含」分段，段内名字序")
+    func databaseRankingGroups() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let db = makeDatabase(fixture)
+        try await db.open()
+
+        // 名字刻意交错写入：结果对不对只看排序，不看插入顺序。
+        let names = ["quoted.txt", "xquote.txt", "quote.txt", "quote", "aquote.bak"]
+        try await db.upsert(names.map { name in
+            FileIndexEntry(path: fixture.root.appendingPathComponent(name).path,
+                           name: name, isDirectory: false, ext: "txt", kind: "other")
+        })
+
+        let result = try await db.query(query("quote"))
+        #expect(result.entries.map(\.name) == [
+            "quote",          // 完全相等
+            "quote.txt",      // 前缀，段内名字序
+            "quoted.txt",
+            "aquote.bak",     // 其余，名字序
+            "xquote.txt",
+        ])
+        #expect(result.total == 5)
+        #expect(result.totalIsExact)
+    }
+
+    @Test("SQLite：命中超过计数上限时只报下界")
+    func databaseCountCap() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let db = makeDatabase(fixture)
+        try await db.open()
+
+        let total = FileIndexDatabase.countCap + 3
+        try await db.upsert((0..<total).map { index in
+            FileIndexEntry(path: fixture.root.appendingPathComponent("cap-\(index).txt").path,
+                           name: "cap-\(index).txt", isDirectory: false, ext: "txt", kind: "other")
+        })
+
+        let result = try await db.query(query("cap-", limit: 10))
+        #expect(result.entries.count == 10)
+        #expect(result.total == FileIndexDatabase.countCap)
+        #expect(!result.totalIsExact)
+
+        // 封顶线以下的命中仍要给精确总数。
+        let few = try await db.query(query("cap-1.txt", limit: 10))
+        #expect(few.total == 1)
+        #expect(few.totalIsExact)
+    }
+
     @Test("SQLite：子目录删除对 LIKE 通配字符安全，元数据重开仍在")
     func databaseDeleteAndPersist() async throws {
         let fixture = try makeFixture()

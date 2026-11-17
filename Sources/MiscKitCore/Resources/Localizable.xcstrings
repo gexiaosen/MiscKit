@@ -1480,6 +1480,22 @@
         }
       }
     },
+    "files.count.many": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%lld+ items (showing first %lld)"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%lld+ 条，仅显示前 %lld 条"
+          }
+        }
+      }
+    },
     "files.count.truncated": {
       "extractionState": "manual",
       "localizations": {

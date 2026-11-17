@@ -36,6 +36,8 @@ public final class FileIndex {
     public private(set) var lastError: String?
 
     @ObservationIgnored private let database: FileIndexDatabase
+    /// 查询专用连接：与写连接分离，增量更新/子树重扫再忙也不会把按键的查询堵在后面。
+    @ObservationIgnored private let reader: FileIndexDatabase
     @ObservationIgnored private let databaseURL: URL
     @ObservationIgnored private let overrideRoots: [URL]
     @ObservationIgnored private let isDisabled: Bool
@@ -54,6 +56,7 @@ public final class FileIndex {
     @ObservationIgnored private var isApplying = false
     @ObservationIgnored private var isRebuilding = false
     @ObservationIgnored private var observingRoots = false
+    @ObservationIgnored private var readerFailed = false
 
     private init() {
         #if DEBUG
@@ -71,6 +74,7 @@ public final class FileIndex {
         databaseURL = AppStoragePaths.file("index.sqlite3")
         #endif
         database = FileIndexDatabase(url: databaseURL)
+        reader = FileIndexDatabase(url: databaseURL, readOnly: true)
     }
 
     // MARK: 状态
@@ -398,19 +402,31 @@ public final class FileIndex {
         isApplying = true
         defer { isApplying = false }
 
-        var plan = FileIndexEventPlanner.makePlan(
-            events: events, policy: makePolicy(),
-            roots: FileIndexRootMap(roots: activeRoots))
+        // 归类比扫盘本身更贵：每个事件一次 `resourceValues` + `fileExists`，一次 churn
+        // （构建、下载、解压）就是几千次 stat；`prune` 还是按路径前缀两两比。
+        // 放在主线程上，整个面板——包括正在输入的搜索——都要排队等它跑完，
+        // 这才是"搜索偶尔卡一两秒"的主因。整套计划搬到后台算。
+        let policy = makePolicy()
+        let roots = activeRoots
+        let rootMap = FileIndexRootMap(roots: roots)
+        let forced = forcedRescans
+        let deferred = deferredDeletions
+        forcedRescans.removeAll()
+        deferredDeletions.removeAll()
+        var plan = await Task.detached(priority: .utility) {
+            var plan = FileIndexEventPlanner.makePlan(events: events, policy: policy,
+                                                      roots: rootMap)
+            guard !plan.needsFullRescan else { return plan }
+            plan.rescans.formUnion(forced)
+            plan.deletions.formUnion(deferred)
+            FileIndexEventPlanner.prune(&plan)
+            return plan
+        }.value
         if plan.needsFullRescan {
             debugLog("full rescan: 事件丢窗（根变更/丢弃标记） serving=\(serving)")
             await runFullScan(roots: currentRoots(), keepServing: serving)
             return
         }
-        plan.rescans.formUnion(forcedRescans)
-        plan.deletions.formUnion(deferredDeletions)
-        forcedRescans.removeAll()
-        deferredDeletions.removeAll()
-        FileIndexEventPlanner.prune(&plan)
         // 目录桶分批消化：一次最多 rescanBatchLimit 个，剩下的退回队列，下一轮接着扫。
         // 被退回那批覆盖到的刷写也一起等——重扫那棵子树时本来就会按磁盘现状重读。
         let split = Self.splitRescans(plan.rescans, limit: Self.rescanBatchLimit)
@@ -426,24 +442,11 @@ public final class FileIndex {
                 try await database.apply(upserts: [], deleting: Array(plan.deletions))
             }
 
-            var entries: [FileIndexEntry] = []
-            var kindCache: [String: String] = [:]
-            var vanished: [String] = []
-
-            for path in plan.fileRefreshes {
-                guard let entry = Self.entry(at: path, isDirectory: false, kindCache: &kindCache) else {
-                    vanished.append(path)
-                    continue
-                }
-                entries.append(entry)
-            }
-            for path in plan.dirRefreshes {
-                if let entry = Self.entry(at: path, isDirectory: true, kindCache: &kindCache) {
-                    entries.append(entry)
-                } else {
-                    vanished.append(path)
-                }
-            }
+            let refreshed = await Task.detached(priority: .utility) {
+                Self.readEntries(files: plan.fileRefreshes, dirs: plan.dirRefreshes)
+            }.value
+            let entries = refreshed.entries
+            let vanished = refreshed.vanished
             if !vanished.isEmpty {
                 try await database.apply(upserts: [], deleting: vanished)
             }
@@ -464,7 +467,9 @@ public final class FileIndex {
             }
 
             try await database.setMeta(FileIndexMetaKey.lastEventID, value: String(plan.maxEventID))
-            indexedCount = try await database.count()
+            // 不在每批增量后重数全库：38 万行的 COUNT(*) 要几十毫秒，而这个数字只在
+            // `.building` 阶段与调试日志里露脸。0 行时才补一次，保障 `serving` 判定。
+            if indexedCount == 0 { indexedCount = try await database.count() }
             lastError = nil
             if !pendingEvents.isEmpty || !forcedRescans.isEmpty || !deferredDeletions.isEmpty {
                 scheduleApply()
@@ -486,6 +491,30 @@ public final class FileIndex {
     }
 
     // MARK: 事件分类
+
+    /// 批量读属性（一次 stat 一条），在后台线程上跑：供增量更新把刷写事件折成索引行。
+    nonisolated static func readEntries(files: Set<String>, dirs: Set<String>)
+        -> (entries: [FileIndexEntry], vanished: [String]) {
+        var entries: [FileIndexEntry] = []
+        var kindCache: [String: String] = [:]
+        var vanished: [String] = []
+        entries.reserveCapacity(files.count + dirs.count)
+        for path in files {
+            guard let entry = entry(at: path, isDirectory: false, kindCache: &kindCache) else {
+                vanished.append(path)
+                continue
+            }
+            entries.append(entry)
+        }
+        for path in dirs {
+            if let entry = entry(at: path, isDirectory: true, kindCache: &kindCache) {
+                entries.append(entry)
+            } else {
+                vanished.append(path)
+            }
+        }
+        return (entries, vanished)
+    }
 
     private nonisolated static func entry(at path: String, isDirectory: Bool,
                                           kindCache: inout [String: String]) -> FileIndexEntry? {
@@ -509,7 +538,7 @@ public final class FileIndex {
             syntax: syntax, category: request.category, scope: request.scope,
             directories: request.directories, sort: request.sort,
             limit: max(request.limit, 1))
-        let result = try await database.query(query)
+        let result = try await readConnection().query(query)
         let items = result.entries.map { entry in
             FileItem(url: URL(fileURLWithPath: entry.path),
                      isDirectory: entry.isDirectory,
@@ -521,8 +550,25 @@ public final class FileIndex {
                      fileSize: entry.size,
                      origin: .index)
         }
+        let truncated = !result.totalIsExact || result.total > items.count
         return FileSearchResponse(items: items, total: result.total,
-                                  isTruncated: result.total > items.count)
+                                  isTruncated: truncated, totalIsExact: result.totalIsExact)
+    }
+
+    /// 只读连接按需打开：打不开（旧库还没生成、文件被换掉）就退回写连接，
+    /// 慢一点但结果对。下一次搜索会再试一次，恢复了就自动回到快路径。
+    private func readConnection() async -> FileIndexDatabase {
+        do {
+            try await reader.open()
+            readerFailed = false
+            return reader
+        } catch {
+            if !readerFailed {
+                readerFailed = true
+                log.error("read connection unavailable, falling back to write connection: \(error.localizedDescription, privacy: .public)")
+            }
+            return database
+        }
     }
 
     // MARK: 根目录

@@ -293,21 +293,27 @@ public struct FileSearchResponse: Sendable {
     public let items: [FileItem]
     public let total: Int
     public let isTruncated: Bool
+    /// 命中数超过计数上限时 `total` 只是下界，界面显示「1000+」而不是一个精确数字。
+    public let totalIsExact: Bool
     public let notice: String?
     public let isSpotlightAvailable: Bool
 
     public init(items: [FileItem], total: Int, isTruncated: Bool,
+                totalIsExact: Bool = true,
                 notice: String? = nil, isSpotlightAvailable: Bool = true) {
         self.items = items
         self.total = total
         self.isTruncated = isTruncated
+        self.totalIsExact = totalIsExact
         self.notice = notice
         self.isSpotlightAvailable = isSpotlightAvailable
     }
 
     public var countText: String {
         if isTruncated {
-            return L10n.Files.Count.truncated(total, items.count)
+            return totalIsExact
+                ? L10n.Files.Count.truncated(total, items.count)
+                : L10n.Files.Count.many(total, items.count)
         }
         return L10n.Files.Count.exact(total)
     }
