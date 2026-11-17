@@ -173,11 +173,14 @@ jobs:
           DMG_PATH="${RUNNER_TEMP}/misckit-build/product/${DMG_NAME}"
           DMG_SIZE="$(stat -f%z "$DMG_PATH")"
           SIG="$(cat /tmp/sparkle-signature.txt)"
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq .body > /tmp/appcast-notes.md
+          # Sparkle 的 <description> 是按 HTML 渲染的：塞 Markdown 会让 `###`、`**`
+          # 原样显示出来（1.0.1 首发的更新窗就是一坨字）。这里按 CHANGELOG 转 HTML，
+          # 与 GitHub Release 正文（Markdown）同源不同格式，两边永远一致。
+          python3 ./Scripts/changelog-to-html.py "$VERSION" > /tmp/appcast-notes.html
           python3 - "$VERSION" "$BUILD" "$GITHUB_REPOSITORY" "$DMG_NAME" "$DMG_SIZE" "$SIG" <<'PYEOF'
           import sys
           version, build, repo, dmg_name, dmg_size, sig = sys.argv[1:7]
-          notes = open('/tmp/appcast-notes.md').read().replace(']]>', ']]&gt;')
+          notes = open('/tmp/appcast-notes.html').read().replace(']]>', ']]&gt;')
           pub_date = __import__('datetime').datetime.now(__import__('datetime').timezone.utc).strftime('%a, %d %b %Y %H:%M:%S +0000')
           appcast = f'''<?xml version="1.0" encoding="utf-8" standalone="no"?>
           <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0">
