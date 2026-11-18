@@ -1,65 +1,79 @@
 #!/bin/bash
-# 把签名证书上传进 GitHub Secrets，供 .github/workflows/release.yml 在 CI 里复用。
+# 把签名证书写进 GitHub Secrets，供 .github/workflows/release.yml 在 CI 里复用。
 #
 # 为什么需要它：ad-hoc 包的 designated requirement 就是 cdhash，而版本号写在
 # Info.plist 里被 CodeDirectory 哈希覆盖 ⇒ 每发一版身份必变 ⇒ TCC 的文件夹授权
-# 与钥匙串 ACL 记录全部作废。用固定证书签名后 DR 变成
-# `identifier + anchor apple generic + leaf CN`，一次授权跨版本有效。
+# 与钥匙串 ACL 记录全部作废，装一次新版就要重点一遍「桌面/文稿/下载」。
+# 用固定证书签名后 DR 变成 `identifier + anchor apple generic + leaf CN`，
+# 与 cdhash 无关，一次授权跨版本有效。
 #
-# 用法：
-#   ./Scripts/upload-signing-cert.sh ~/Desktop/MiscKitSigning.p12
+# 用法（两种）：
+#   ./Scripts/upload-signing-cert.sh
+#       直接从登录钥匙串导出 Apple Development 身份，不需要图形界面。
+#       macOS 26 的「钥匙串访问」藏在 /System/Library/CoreServices/Applications，
+#       界面还常是半残的（窗口开在屏幕外、列表加载不出来），这条路更省事。
 #
-# p12 从哪来：钥匙串访问 → 登录 → 我的证书 → 右键
-#   "Apple Development: gexiaosen@outlook.com (AK52JP2G5T)" → 导出 → 选 .p12 → 设密码。
-# 导出时务必只选这一个身份（"我的证书"里的那一行），别把整串私钥一起导出去。
+#   ./Scripts/upload-signing-cert.sh ~/Desktop/MiscKitSign.p12
+#       用你手动导出的 p12（钥匙串访问 → 登录 → 我的证书 → 右键导出）。
 #
-# 本脚本做三件事：校验 p12 → 用 stdin 直接写入两个 secret → 回读确认。
-# base64 只在管道里过一手，不落盘、不进 shell 历史、不打印。
+# 安全说明：证书私钥会进入 GitHub Secrets。仓库必须保持 private；
+# 不用了随时删：gh secret delete MISCKIT_SIGNING_CERT_P12
+# base64 只在管道里过一手，不写普通文件、不进 shell 历史、不打印。
 set -euo pipefail
 
 REPO_SLUG="${MISCKIT_REPO:-gexiaosen/MiscKit}"
+SIGNING_CN="${MISCKIT_SIGNING_CN:-Apple Development: }"
 
 die() { echo "✗ $*" >&2; exit 1; }
 
-[ $# -eq 1 ] || die "用法：$0 <证书.p12>"
-P12="$1"
-[ -f "$P12" ] || die "找不到文件：$P12"
-
-command -v gh >/dev/null || die "没装 gh（brew install gh），或手动上传两个 secret 也行"
+command -v gh >/dev/null || die "没装 gh（brew install gh）"
 gh auth status >/dev/null 2>&1 || die "gh 未登录：gh auth login"
 
-# 先确认这是一个带私钥的 PKCS#12，而不是只含证书的 .cer 改名
-if ! openssl pkcs12 -in "$P12" -noout -passin pass: 2>/dev/null; then
-    printf '证书密码（导出 .p12 时设的那个，输入不回显）：'
+WORK="$(mktemp -d)"
+chmod 700 "$WORK"
+trap 'rm -rf "$WORK"' EXIT
+
+# 钥匙串访问导出的 p12 用 RC2-40-CBC，OpenSSL 3+ 默认 provider 已移除，
+# 必须显式 -legacy 才读得开；本脚本自己导的（3DES）两种都能读。
+read_p12() {
+    local file="$1" pass="$2"
+    shift 2
+    openssl pkcs12 -in "$file" -passin "pass:${pass}" -legacy "$@" 2>/dev/null \
+        || openssl pkcs12 -in "$file" -passin "pass:${pass}" "$@" 2>/dev/null
+}
+
+if [ $# -ge 1 ]; then
+    P12="$1"
+    [ -f "$P12" ] || die "找不到文件：$P12"
+    printf 'p12 密码（导出时设的那个，输入不回显；没设过直接回车）：'
     read -rs P12_PASS
     echo
-    [ -n "$P12_PASS" ] || die "密码为空"
-    openssl pkcs12 -in "$P12" -noout -passin "pass:$P12_PASS" 2>/dev/null \
-        || die "密码不对，或这个文件不是 PKCS#12"
+    read_p12 "$P12" "$P12_PASS" -noout >/dev/null \
+        || die "打不开这个 p12：密码不对，或不是 PKCS#12 格式"
 else
-    P12_PASS=""
+    echo "→ 从登录钥匙串导出「${SIGNING_CN}…」身份"
+    P12="$WORK/signing.p12"
+    P12_PASS="$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
+    CN="$(python3 "$(dirname "$0")/export-identity-p12.py" "$SIGNING_CN" "$P12" "$P12_PASS")" \
+        || die "导出失败（钥匙串里没有匹配这个 CN 的身份？）"
+    echo "  选中：$CN"
 fi
 
-# 证书里必须有私钥，否则 CI 只能拿到公钥、codesign 会失败
-openssl pkcs12 -in "$P12" -nocerts -noout -passin "pass:$P12_PASS" 2>/dev/null \
-    | grep -q "BEGIN" || die "这个 p12 里没有私钥（只导出了证书）。重新导出时要在「我的证书」里选那条带钥匙图标的身份。"
+# 必须有私钥，否则 CI 只能拿到公钥、codesign 会失败
+read_p12 "$P12" "$P12_PASS" -nocerts -nodes | grep -q "BEGIN" \
+    || die "这个 p12 里没有私钥（只导出了证书）"
 
 echo "→ 写入 secret: MISCKIT_SIGNING_CERT_P12"
 base64 -i "$P12" | tr -d '\n' | gh secret set MISCKIT_SIGNING_CERT_P12 --repo "$REPO_SLUG"
-
 echo "→ 写入 secret: MISCKIT_SIGNING_CERT_PASSWORD"
-if [ -z "$P12_PASS" ]; then
-    printf 'p12 没有密码，CI 侧也留空；建议之后重导一份带密码的\n'
-fi
 printf '%s' "$P12_PASS" | gh secret set MISCKIT_SIGNING_CERT_PASSWORD --repo "$REPO_SLUG"
 
-echo "✓ 已写入。确认清单："
+echo
+echo "✓ 已写入："
 gh secret list --repo "$REPO_SLUG" | grep -E "MISCKIT_SIGNING_CERT" || true
 echo
-echo "下一步：打 tag 发一版，CI 会用这个身份签名。"
+echo "下一步：打 tag 发一版，CI 会用这个身份签名（工作流里专门有一步核对 DR，"
+echo "        签成 ad-hoc 会直接失败，不会静默退回）。"
 echo "  · 换身份那一次，文件夹权限与钥匙串授权会**再问一轮**，点「始终允许」；"
 echo "  · 之后任何版本都不再问。"
 echo "  · 证书一年到期：过期后新签的包身份又变了，重跑本脚本上传新证书即可。"
-echo
-echo "提醒：证书私钥现在同时存在于 GitHub Secrets。仓库必须保持 private，"
-echo "      并建议在 GitHub 上开启 secret 扫描告警；不用了随时删：gh secret delete MISCKIT_SIGNING_CERT_P12"
