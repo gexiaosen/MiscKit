@@ -123,8 +123,92 @@ jobs:
             exit 1
           fi
 
-      - name: Package .app (ad-hoc)
+      # 签名身份决定系统认不认得出"还是那个 MiscKit"：
+      #   · ad-hoc 的 designated requirement 就是 cdhash，版本号写在 Info.plist 里、
+      #     被 CodeDirectory 哈希覆盖 ⇒ 每发一版身份必变 ⇒ 文件夹权限（TCC）与钥匙串
+      #     ACL 的记录全部作废，用户重装一次就要重点一遍「桌面/文稿/下载」。
+      #   · 固定证书的 requirement 是 `identifier + anchor apple generic + leaf CN`，
+      #     与 cdhash 无关，一次授权跨版本有效。
+      # secret 缺失时**不失败**（首次配置前仍能发版），只告警并退回 ad-hoc；
+      # 配了就必须真的签上，签不上要炸——静默退回 ad-hoc 正是这个问题反复复发的原因。
+      - name: Prepare signing identity
+        id: signing
+        env:
+          CERT_P12_BASE64: ${{ secrets.MISCKIT_SIGNING_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MISCKIT_SIGNING_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CERT_P12_BASE64}" ]; then
+            echo "::warning title=未配置签名证书::回退 ad-hoc —— 重装后文件夹权限与钥匙串授权会重新询问。见 Scripts/export-signing-cert.sh"
+            exit 0
+          fi
+          if [ -z "${CERT_PASSWORD}" ]; then
+            echo "::error title=缺 CERT 密码::已有 MISCKIT_SIGNING_CERT_P12 却没有 MISCKIT_SIGNING_CERT_PASSWORD"
+            exit 1
+          fi
+          KEYCHAIN="${RUNNER_TEMP}/signing.keychain-db"
+          KEYCHAIN_PASS="$(uuidgen)"
+          CERT_PATH="${RUNNER_TEMP}/signing.p12"
+          printf '%s' "${CERT_P12_BASE64}" | tr -d '[:space:]' | base64 --decode > "${CERT_PATH}"
+          security create-keychain -p "${KEYCHAIN_PASS}" "${KEYCHAIN}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN}"
+          security unlock-keychain -p "${KEYCHAIN_PASS}" "${KEYCHAIN}"
+          # 只导入叶子证书时链是断的（CSSMERR_TP_NOT_TRUSTED），find-identity -v 会列空。
+          # runner 一般自带，这里补一次兜底；装不上不影响（后面对身份有二次判定）。
+          if curl -fsSL -o "${RUNNER_TEMP}/wwdr.cer" \
+               https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer; then
+            security add-certificates -k "${KEYCHAIN}" "${RUNNER_TEMP}/wwdr.cer" || true
+          fi
+          security import "${CERT_PATH}" -k "${KEYCHAIN}" -P "${CERT_PASSWORD}" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          # codesign 要免交互取私钥，必须先放开 partition list（macOS 10.12+ 必需）
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "${KEYCHAIN_PASS}" "${KEYCHAIN}" > /dev/null
+          security list-keychains -d user -s "${KEYCHAIN}" \
+            $(security list-keychains -d user | tr -d '"') 
+          rm -f "${CERT_PATH}"
+          # -v 只列"信任链完整"的身份；runner 上万一缺 WWDR 中间证书就会列空。
+          # 退一步用不带 -v 的列表（codesign 本身不要求信任链，但 --verify --strict 会），
+          # 同时把 CSSMERR 后缀去掉——它会让 codesign 认不出这个名字。
+          IDENTITY="$(security find-identity -v -p codesigning "${KEYCHAIN}" \
+            | sed -n 's/.*"\(.*\)"/\1/p' | head -1)"
+          if [ -z "${IDENTITY}" ]; then
+            echo "::warning title=信任链不完整::find-identity -v 为空，多半是 runner 缺 AppleWWDRCA 中间证书"
+            IDENTITY="$(security find-identity -p codesigning "${KEYCHAIN}" \
+              | sed -n 's/.*"\(.*\)"/\1/p' | sed 's/ *(CSSMERR[^)]*)//' | head -1)"
+          fi
+          if [ -z "${IDENTITY}" ]; then
+            echo "::error title=证书不可用::p12 导入成功但列不出可签名身份，检查 p12 是否含私钥"
+            exit 1
+          fi
+          echo "签名身份: ${IDENTITY}"
+          echo "MISCKIT_SIGN_IDENTITY=${IDENTITY}" >> "${GITHUB_ENV}"
+
+      - name: Package .app
         run: MISCKIT_SCRATCH="${RUNNER_TEMP}/misckit-build" ./Scripts/make-app.sh release
+
+      # 签没签上是事实问题，不能靠"脚本没报错"推断：直接看包上的签名形态，
+      # 期望证书签名却拿到 ad-hoc 就立刻失败，别把会重复弹权限的包发出去。
+      - name: Verify signature identity
+        run: |
+          set -euo pipefail
+          APP="${RUNNER_TEMP}/misckit-build/product/MiscKit.app"
+          codesign -dv --verbose=4 "$APP" 2>&1 | grep -E '^(Identifier|Signature|Authority|TeamIdentifier)' || true
+          DR="$(codesign -dr- "$APP" 2>&1 | tail -1)"
+          echo "DR: $DR"
+          if [ -n "${MISCKIT_SIGN_IDENTITY:-}" ]; then
+            echo "$DR" | grep -q 'anchor apple generic' || {
+              echo "::error title=签名未生效::期望 ${MISCKIT_SIGN_IDENTITY}，实际 DR 仍是 cdhash"; exit 1; }
+          else
+            echo "::warning title=当前为 ad-hoc 包::重装后需要重新授权文件夹与钥匙串"
+          fi
+
+      - name: Cleanup signing keychain
+        if: always()
+        run: |
+          KEYCHAIN="${RUNNER_TEMP}/signing.keychain-db"
+          [ -e "$KEYCHAIN" ] || exit 0
+          security delete-keychain "$KEYCHAIN" || true
 
       - name: Package .dmg
         run: |
