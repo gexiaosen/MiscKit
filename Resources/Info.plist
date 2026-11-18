@@ -4,11 +4,6 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
-	<key>CFBundleLocalizations</key>
-	<array>
-		<string>en</string>
-		<string>zh-Hans</string>
-	</array>
 	<key>CFBundleDisplayName</key>
 	<string>MiscKit</string>
 	<key>CFBundleExecutable</key>
@@ -19,14 +14,19 @@
 	<string>app.misckit.MiscKit</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>en</string>
+		<string>zh-Hans</string>
+	</array>
 	<key>CFBundleName</key>
 	<string>MiscKit</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.1</string>
+	<string>1.0.2</string>
 	<key>CFBundleVersion</key>
-	<string>103</string>
+	<string>104</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
 	<key>LSUIElement</key>
@@ -39,15 +39,10 @@
 	<false/>
 	<key>NSSupportsSuddenTermination</key>
 	<false/>
-	<!-- Sparkle 自动更新：固定指向最新 Release 的 appcast（releases/latest/download
-	     是 GitHub 官方支持的稳定地址，免建 Pages）。EdDSA 公钥与 CI Secrets 里的
-	     私钥配对，私钥只进 GitHub Secrets、绝不入仓库。 -->
-	<key>SUFeedURL</key>
-	<string>https://github.com/gexiaosen/MiscKit/releases/latest/download/appcast.xml</string>
-	<!-- 跳过 Sparkle 首启授权弹窗（UpdateDelegate 返回 false）就必须显式开启自动检查：
-	     Sparkle 对 SUEnableAutomaticChecks 没有"缺省即 YES"的兜底，无值=静默检查永不上路。 -->
 	<key>SUEnableAutomaticChecks</key>
 	<true/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/gexiaosen/MiscKit/releases/latest/download/appcast.xml</string>
 	<key>SUPublicEDKey</key>
 	<string>7nh4PtJHOhvw9BPmzXe/CZbk2VvzqsMuG0+dpUiDh5k=</string>
 </dict>
