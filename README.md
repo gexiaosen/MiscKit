@@ -77,7 +77,7 @@ swift test  --arch arm64 --scratch-path "$HOME/.cache/misckit-build"
 ### Data Storage
 
 - **Preferences, Scratchpad Sheets, Aliases, File Scopes & Recents**: `UserDefaults`.
-- **File Index, App Snapshot, Settings Pane Cache, Quicklinks, Hosts State & Backups**: `~/Library/Application Support/MiscKit/` (hosts backups roll the latest 10 snapshots).
+- **File Index, App Snapshot, Settings Pane Cache, Quicklinks, Hosts State & Backups**: `~/Library/Application Support/MiscKit/` for Release, `~/Library/Application Support/MiscKit-Dev/` for Debug. These are separate indexes; uninstalling the Dev app must never delete the Release directory.
 - **OTP Secrets**: Stored strictly in the macOS Keychain; JSON metadata stores only account identifiers and display labels.
 
 ### Security Model & Privacy
@@ -177,7 +177,7 @@ make install                    # 打包 Release → 干净退出旧实例 → �
 ### 数据存储
 
 - **偏好设置、稿纸内容、应用别名、文件范围与最近打开**：`UserDefaults`。
-- **文件索引、应用快照、设置面板缓存、网址别名与 Hosts 备份**：`~/Library/Application Support/MiscKit/`（Hosts 备份滚动保留最近 10 份）。
+- **文件索引、应用快照、设置面板缓存、网址别名与 Hosts 备份**：正式版在 `~/Library/Application Support/MiscKit/`，开发版在 `~/Library/Application Support/MiscKit-Dev/`。两边索引完全独立；卸载开发版时绝对不要删除正式版的 `MiscKit` 目录。
 - **OTP 密钥**：仅存于 macOS 系统钥匙串，本地 JSON 元数据仅保存条目名与顺序。
 
 ### 安全机制与隐私
