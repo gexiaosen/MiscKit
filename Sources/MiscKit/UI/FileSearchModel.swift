@@ -27,11 +27,16 @@ final class FileSearchModel {
     let settings = FileSearchSettings.shared
 
     /// 限制单次展示的最大行数，保证响应性能与滚动流畅。
-    static let resultLimit = 80
+    /// 300 行由 `LazyVStack` 懒渲染；真正决定首屏的是上面的 fast 段，不是这个上限。
+    static let resultLimit = 300
 
     private var searchTask: Task<Void, Never>?
+    private var fastPreviewTask: Task<Void, Never>?
     private var dragGuardTask: Task<Void, Never>?
     private var generation = 0
+    /// 记录一次键入从 `update` 到 fast 首屏落地的耗时；只用于 `file.firstFast` 面包屑。
+    private var firstFastStartedAt: Date?
+    private var firstFastLoggedToken = 0
     private var lastTapAt: Date?
     private var tapBurst = 0
     private let service = FileSearchService.shared
@@ -113,12 +118,19 @@ final class FileSearchModel {
         // 索引就绪时查询走 SQLite，Spotlight 探针纯属白烧 I/O：
         // 它扫的是整盘 `Applications`，一次 1.5 秒上限，正好和按键抢磁盘。
         if !FileIndex.shared.isReady { service.prewarmSpotlightAvailability() }
-        schedule(delay: isKeywordSearch() ? .milliseconds(90) : .zero)
+        firstFastStartedAt = Date()
+        // fast 段只查等值 + 前缀，0.02–1ms；先立即上屏，body/count 仍然等 50ms。
+        // 这样连续键入不会把包含段/计数提前，首屏也不用再白等一个去抖窗口。
+        let delay: Duration = isKeywordSearch() ? .milliseconds(50) : .zero
+        schedule(delay: delay)
+        scheduleFastPreview(token: generation, query: query)
     }
 
     func deactivate() {
         searchTask?.cancel()
         searchTask = nil
+        fastPreviewTask?.cancel()
+        fastPreviewTask = nil
         isSearching = false
     }
 
@@ -335,6 +347,8 @@ final class FileSearchModel {
 
     private func schedule(delay: Duration) {
         searchTask?.cancel()
+        fastPreviewTask?.cancel()
+        service.cancelPendingQueries()
         generation += 1
         let token = generation
         let query = currentQuery
@@ -346,30 +360,146 @@ final class FileSearchModel {
         }
     }
 
+    /// 键入后不等 50ms 去抖，先把只在 SQLite 快段的等值/前缀结果贴上。
+    /// 空结果不在这里落地：否则每敲一个中间状态都会闪一下空态，等 `run` 的 fast 再判。
+    private func scheduleFastPreview(token: Int, query: String) {
+        guard token == generation, isKeywordSearch(query), FileIndex.shared.isReady else { return }
+        let request = FileSearchRequest(text: query, category: category,
+                                        scope: settings.scope,
+                                        directories: settings.directories,
+                                        sort: settings.sort,
+                                        limit: Self.resultLimit)
+        fastPreviewTask = Task { [weak self] in
+            guard let self else { return }
+            guard let fast = await self.service.searchFast(request) else { return }
+            guard token == self.generation, !Task.isCancelled else { return }
+            if !fast.items.isEmpty {
+                self.applyFast(fast)
+                self.noteFirstFast(token: token)
+            }
+        }
+    }
+
+    /// 首屏埋点只到「fast 结果已应用到 model」，不含 SwiftUI 下一帧渲染；
+    /// 不记查询词，只记长度与毫秒，避免把剪贴板带入的文本写进日志。
+    private func noteFirstFast(token: Int) {
+        guard token == generation, firstFastLoggedToken != token,
+              let started = firstFastStartedAt else { return }
+        firstFastLoggedToken = token
+        let ms = Int(Date().timeIntervalSince(started) * 1000)
+        Breadcrumbs.event("file.firstFast", [
+            "ms": String(ms),
+            "termLen": String(currentQuery.count),
+            "sort": settings.sort.rawValue,
+        ])
+    }
+
     private func run(query: String, token: Int) async {
         let request = FileSearchRequest(text: query, category: category,
                                         scope: settings.scope,
                                         directories: settings.directories,
                                         sort: settings.sort,
                                         limit: Self.resultLimit)
+
+        // 索引就绪时走三段：fast 先上屏，body 补包含段，count 只更新底栏。
+        // 快段为空时不拿空列表覆盖旧结果，等 body 明确返回空再说，避免输入过程中闪空。
+        if isKeywordSearch(query), FileIndex.shared.isReady,
+           let fast = await service.searchFast(request) {
+            guard token == generation, !Task.isCancelled else { return }
+            applyFast(fast)
+            noteFirstFast(token: token)
+            if !fast.isTruncated { return }
+
+            if let body = await service.searchBody(request) {
+                guard token == generation, !Task.isCancelled else { return }
+                applyBody(body)
+                // body 已经把三段跑完且没到上限，total 就是精确值，不必再扫一遍计数。
+                if !body.isTruncated { return }
+            } else {
+                // 补全段失败时不要继续拿计数去改底栏：列表还只是前缀，底栏说“1000+”
+                // 会让人以为包含段的结果已经进来了。保持快段的下界即可。
+                return
+            }
+            if let count = await service.searchCount(request) {
+                guard token == generation, !Task.isCancelled else { return }
+                applyCount(count)
+            }
+            return
+        }
+
         let response = await service.search(request)
         guard token == generation, !Task.isCancelled else { return }
-        items = response.items
+        applyComplete(response)
+    }
+
+    private func applyFast(_ response: FileSearchResponse) {
+        guard !response.items.isEmpty else {
+            // 前缀/等值没命中，不代表包含段也没有；保留旧列表，让“搜索中”继续。
+            // 但如果快段已经确定到底（通配/时间排序），空就是空，直接落空态。
+            if response.isTruncated {
+                isSearching = true
+            } else {
+                applyBody(response)
+            }
+            return
+        }
+        if response.items != items { items = response.items }
         total = response.total
         isTruncated = response.isTruncated
         totalIsExact = response.totalIsExact
         notice = response.notice
         isSearching = false
+        // 快段只是最终结果的前缀：这里不裁多选集合，否则 body 追加回来的
+        // 已选项会因为“暂时不在快段里”被误删。等 body/complete 再裁。
+        reconcileSelection(pruneSelectedIDs: false)
+    }
+
+    private func applyBody(_ response: FileSearchResponse) {
+        if response.items != items { items = response.items }
+        total = response.total
+        isTruncated = response.isTruncated
+        totalIsExact = response.totalIsExact
+        notice = response.notice
+        isSearching = false
+        reconcileSelection()
+    }
+
+    private func applyCount(_ response: FileSearchResponse) {
+        // 计数段只动底栏；列表仍以 body 为准。
+        total = response.total
+        totalIsExact = response.totalIsExact
+        isTruncated = !response.totalIsExact || response.total > items.count
+    }
+
+    private func applyComplete(_ response: FileSearchResponse) {
+        if response.items != items { items = response.items }
+        total = response.total
+        isTruncated = response.isTruncated
+        totalIsExact = response.totalIsExact
+        notice = response.notice
+        isSearching = false
+        reconcileSelection()
+    }
+
+    private func reconcileSelection(pruneSelectedIDs: Bool = true) {
         selection = min(selection, max(items.count - 1, 0))
         let visibleIDs = Set(items.map(\.id))
-        selectedIDs.formIntersection(visibleIDs)
+        if pruneSelectedIDs {
+            selectedIDs.formIntersection(visibleIDs)
+        }
         if let anchor = selectionAnchor {
             selectionAnchor = items.isEmpty ? nil : min(anchor, items.count - 1)
         }
     }
 
     private func isKeywordSearch() -> Bool {
-        if case .search = parsedKind() { return true }
+        isKeywordSearch(currentQuery)
+    }
+
+    private func isKeywordSearch(_ query: String) -> Bool {
+        if case .search = FileQueryParser(aliases: FileAliasStore.shared.aliases).parse(query) {
+            return true
+        }
         return false
     }
 

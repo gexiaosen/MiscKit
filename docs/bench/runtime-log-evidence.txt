@@ -1,0 +1,7 @@
+Timestamp               Ty Process[PID:TID]
+2026-11-20 17:06:50.876 Df MiscKit[16705:6656f7] [app.misckit.launcher:breadcrumb] file.phase from=idle mem=23MB rows=0 to=opening up=0s
+2026-11-20 17:06:51.208 Df MiscKit[16705:6656f7] [app.misckit.launcher:breadcrumb] file.phase from=opening mem=25MB rows=735704 to=ready up=0s
+2026-11-20 17:06:54.599 Df MiscKit[16705:6656f7] [app.misckit.launcher:breadcrumb] file.search count=32 mem=40MB ms=549 termLen=40 up=4s via=index
+2026-11-20 17:06:55.420 Df MiscKit[16705:6656f7] [app.misckit.launcher:breadcrumb] file.search count=1 mem=51MB ms=24 termLen=40 up=5s via=index
+2026-11-20 17:11:28.529 Df MiscKit[16705:6656f7] [app.misckit.launcher:breadcrumb] file.search count=3 mem=55MB ms=512 termLen=39 up=278s via=index
+2026-11-20 17:12:08.035 Df MiscKit[16705:6656f7] [app.misckit.launcher:breadcrumb] file.search count=3 mem=48MB ms=19 termLen=37 up=317s via=index

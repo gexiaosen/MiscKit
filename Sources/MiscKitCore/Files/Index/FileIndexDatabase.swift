@@ -46,6 +46,17 @@ struct FileIndexQueryResult: Sendable {
     let entries: [FileIndexEntry]
     let total: Int
     let totalIsExact: Bool
+    /// 结果集是否已经翻到底。为假时 `total` 只是下界，调用方还可以继续跑补全/计数阶段。
+    let exhausted: Bool
+}
+
+/// 查询阶段。`fast` 只取等值 + 前缀，先让第一屏有内容；`body` 再补包含段；
+/// `count` 只算总数。三个阶段分开后，慢的计数不再决定首屏。
+enum FileIndexQueryPhase: Sendable {
+    case complete
+    case fast
+    case body
+    case count
 }
 
 struct FileIndexQuery: Sendable {
@@ -81,18 +92,48 @@ enum FileIndexError: LocalizedError, Equatable {
 actor FileIndexDatabase {
     private let url: URL
     private let readOnly: Bool
+    private let cacheSizeKB: Int
     // 连接只在 actor 内使用；deinit 需要关闭它，而 deinit 是非隔离的。
     nonisolated(unsafe) private var db: OpaquePointer?
+    /// `sqlite3_interrupt` 必须能从查询所在的 actor 之外调用；句柄与“是否有可中断的 count
+    /// 正在执行”一起由这把锁保护，避免在连接关闭后拿到悬空指针，也避免空转时设置中断标志、
+    /// 误伤下一条查询。
+    private let interruptLock = NSLock()
+    nonisolated(unsafe) private var interruptHandle: OpaquePointer?
+    nonisolated(unsafe) private var interruptibleQueryRunning = false
 
-    init(url: URL, readOnly: Bool = false) {
+    init(url: URL, readOnly: Bool = false, cacheSizeKB: Int = 32 * 1024) {
         self.url = url
         self.readOnly = readOnly
+        self.cacheSizeKB = cacheSizeKB
     }
 
     deinit {
+        storeInterruptHandle(nil)
         if let db {
             sqlite3_close_v2(db)
         }
+    }
+
+    /// 只中断正在执行的 count 查询。`fast` / `body` 有自己的连接，也不会被标记为可中断；
+    /// 没有 count 在跑时是 no-op，不会把中断标志留给下一条 SQL。
+    nonisolated func interrupt() {
+        interruptLock.lock()
+        defer { interruptLock.unlock() }
+        guard interruptibleQueryRunning, let interruptHandle else { return }
+        sqlite3_interrupt(interruptHandle)
+    }
+
+    nonisolated private func storeInterruptHandle(_ handle: OpaquePointer?) {
+        interruptLock.lock()
+        interruptHandle = handle
+        interruptLock.unlock()
+    }
+
+    nonisolated private func storeInterruptibleQueryRunning(_ value: Bool) {
+        interruptLock.lock()
+        interruptibleQueryRunning = value
+        interruptLock.unlock()
     }
 
     func open() throws {
@@ -111,13 +152,14 @@ actor FileIndexDatabase {
             throw FileIndexError.open(message)
         }
         db = handle
+        storeInterruptHandle(handle)
         sqlite3_busy_timeout(handle, 4000)
         if readOnly {
             // 只读连接自己不做 checkpoint，页缓存与 mmap 归它自己：
             // 38 万行、800MB 的库靠 read() 逐页取，冷页就是几十毫秒起步。
             try execute("PRAGMA query_only=1")
             try execute("PRAGMA mmap_size=\(256 * 1024 * 1024)")
-            try execute("PRAGMA cache_size=\(-32 * 1024)")
+            try execute("PRAGMA cache_size=\(-cacheSizeKB)")
             try execute("PRAGMA temp_store=MEMORY")
             return
         }
@@ -129,6 +171,7 @@ actor FileIndexDatabase {
 
     func close() {
         guard let db else { return }
+        storeInterruptHandle(nil)
         sqlite3_close_v2(db)
         self.db = nil
     }
@@ -517,84 +560,126 @@ actor FileIndexDatabase {
     }
 
     func query(_ query: FileIndexQuery) throws -> FileIndexQueryResult {
+        try self.query(query, phase: .complete)
+    }
+
+    /// `phase == .complete` 保持原有的一次性语义，测试和兜底路径用它；
+    /// 主搜索走 `.fast` → `.body` → `.count`，慢段不再挡首屏。
+    func query(_ query: FileIndexQuery, phase: FileIndexQueryPhase) throws -> FileIndexQueryResult {
+        let interruptible = phase == .body || phase == .count
+        if interruptible { storeInterruptibleQueryRunning(true) }
+        defer {
+            if interruptible { storeInterruptibleQueryRunning(false) }
+        }
+
         let limit = max(query.limit, 0)
         let base = baseFilter(query)
         let rankingIndex = query.syntax.terms.firstIndex { !$0.isNegated }
 
+        if phase == .count {
+            let count = try cappedCount(fullFilter(query))
+            return FileIndexQueryResult(entries: [], total: count.count,
+                                        totalIsExact: count.exact, exhausted: true)
+        }
+
         guard limit > 0 else {
             let count = try cappedCount(fullFilter(query))
             return FileIndexQueryResult(entries: [], total: count.count,
-                                        totalIsExact: count.exact)
+                                        totalIsExact: count.exact, exhausted: true)
         }
 
         // 相关度排序走「分段取」：完全相等 → 前缀 → 其余，三段合起来正好覆盖全部命中，
-        // 段内按名字序。每段都顺着 `name_folded` 索引走、凑够 limit+1 就停，
-        // 不再对全部命中做 CASE 排序 + 临时 B 树 + 计数（实测 251ms → 个位数）。
+        // 段内按名字序。前两段顺着 `name_folded` 索引区间走，第三段才扫包含；
+        // `.fast` 只跑前两段，命中够了就停。
         if query.sort == .relevance,
            let rankingIndex,
-           case let first = query.syntax.terms[rankingIndex],
-           !first.text.isEmpty, !first.hasWildcard {
-            let folded = FileIndexText.fold(first.text)
-            let rest = termFilter(query, skipping: rankingIndex)
-            var seen = Set<String>()
-            var collected: [FileIndexEntry] = []
-            var exhausted = true
-            for group in Self.rankingGroups(folded: folded) {
-                if collected.count > limit { break }
-                var filter = base
-                filter.merge(rest)
-                filter.append(group.clause, group.values)
-                let rows = try select(filter, order: "name_folded ASC", limit: limit + 1)
-                if rows.count > limit { exhausted = false }
-                for row in rows where seen.insert(row.path).inserted {
-                    collected.append(row)
-                }
-            }
-            return try finish(collected, limit: limit, filter: fullFilter(query),
-                              exhausted: exhausted)
+           !query.syntax.terms[rankingIndex].text.isEmpty,
+           !query.syntax.terms[rankingIndex].hasWildcard {
+            return try queryRanking(query, base: base, rankingIndex: rankingIndex,
+                                    limit: limit, phase: phase)
         }
 
-        // 其余排序都与表达式索引同式：顺着索引取前 limit+1 条即可，不必先数总数。
+        return try queryOrdered(query, base: base, limit: limit, phase: phase)
+    }
+
+    private func queryRanking(_ query: FileIndexQuery, base: Filter, rankingIndex: Int,
+                              limit: Int, phase: FileIndexQueryPhase) throws -> FileIndexQueryResult {
+        let folded = FileIndexText.fold(query.syntax.terms[rankingIndex].text)
+        let rest = termFilter(query, skipping: rankingIndex)
+        var seen = Set<String>()
+        var collected: [FileIndexEntry] = []
+        var overflow = false
+        for group in Self.rankingGroups(folded: folded, phase: phase) {
+            if collected.count > limit { break }
+            var filter = base
+            filter.merge(rest)
+            filter.append(group.clause, group.values)
+            let rows = try select(filter, order: "name_folded ASC, id ASC", limit: limit + 1)
+            if rows.count > limit { overflow = true }
+            for row in rows where seen.insert(row.path).inserted {
+                collected.append(row)
+            }
+        }
+
+        // `.fast` 只跑了前两段，包含段还没扫，不能宣称“到底了”；
+        // `.body` 三段都跑过，收集数没超过上限才算到底。
+        let exhausted = phase == .fast ? false : (!overflow && collected.count <= limit)
+        return try makeResult(collected, limit: limit, filter: fullFilter(query),
+                              exhausted: exhausted, phase: phase)
+    }
+
+    private func queryOrdered(_ query: FileIndexQuery, base: Filter,
+                              limit: Int, phase: FileIndexQueryPhase) throws -> FileIndexQueryResult {
         let order: String
         switch query.sort {
         case .relevance, .name:
             // 没有可分段的正向词（只有排除词 / 通配词）时退回名字序。
-            order = "name_folded ASC"
+            order = "name_folded ASC, id ASC"
         case .modified:
-            order = "COALESCE(modified, 0) DESC, name_folded ASC"
+            order = "COALESCE(modified, 0) DESC, name_folded ASC, id ASC"
         case .created:
-            order = "COALESCE(created, 0) DESC, name_folded ASC"
+            order = "COALESCE(created, 0) DESC, name_folded ASC, id ASC"
         case .size:
-            order = "COALESCE(size, 0) DESC, name_folded ASC"
+            order = "COALESCE(size, 0) DESC, name_folded ASC, id ASC"
         }
         var filter = base
         filter.merge(termFilter(query, skipping: nil))
         let rows = try select(filter, order: order, limit: limit + 1)
-        return try finish(rows, limit: limit, filter: fullFilter(query),
-                          exhausted: rows.count <= limit)
+        let exhausted = rows.count <= limit
+        return try makeResult(rows, limit: limit, filter: fullFilter(query),
+                              exhausted: exhausted, phase: phase)
     }
 
-    /// 三段排序子句：`name_folded` 上的等值、前缀、包含。前两段能吃索引范围，
-    /// 第三段顺着索引扫、命中够了就停（`LIMIT` 会把扫描截断）。
-    private static func rankingGroups(folded: String) -> [(clause: String, values: [SQLValue])] {
-        [
+    /// 三段排序子句：`name_folded` 上的等值、前缀、包含。
+    /// 前缀改用 `GLOB`：`LIKE 'x%' ESCAPE` 在 SQLite 里会退化成全索引 `SCAN`，
+    /// `GLOB` 才能让规划器走 `name_folded` 的区间；含 `[` / `]` 的名字由 `globPrefix` 转义。
+    private static func rankingGroups(folded: String,
+                                      phase: FileIndexQueryPhase) -> [(clause: String, values: [SQLValue])] {
+        let groups: [(clause: String, values: [SQLValue])] = [
             ("name_folded = ?", [.text(folded)]),
-            ("name_folded LIKE ? ESCAPE '\\'", [.text(FileIndexText.escapeLike(folded) + "%")]),
-            ("name_folded LIKE ? ESCAPE '\\'", [.text("%" + FileIndexText.escapeLike(folded) + "%")]),
+            ("name_folded GLOB ?", [.text(FileIndexText.globPrefix(folded))]),
+            ("instr(name_folded, ?) > 0", [.text(folded)]),
         ]
+        return phase == .fast ? Array(groups.prefix(2)) : groups
     }
 
     /// 截断判定与总数：取到的行没到 limit 说明已经翻到底，总数就是行数；
-    /// 到顶了才去数一遍（有上限，见 `countCap`）。
-    private func finish(_ rows: [FileIndexEntry], limit: Int, filter: Filter,
-                        exhausted: Bool) throws -> FileIndexQueryResult {
+    /// 到顶了才去数一遍（有上限，见 `countCap`）。`.fast` / `.body` 不数，
+    /// 把 `total` 作为下界交给 UI，等 `.count` 阶段再补齐。
+    private func makeResult(_ rows: [FileIndexEntry], limit: Int, filter: Filter,
+                            exhausted: Bool, phase: FileIndexQueryPhase) throws -> FileIndexQueryResult {
         let items = Array(rows.prefix(limit))
+        if phase != .complete {
+            return FileIndexQueryResult(entries: items, total: items.count,
+                                        totalIsExact: exhausted, exhausted: exhausted)
+        }
         guard !exhausted else {
-            return FileIndexQueryResult(entries: items, total: items.count, totalIsExact: true)
+            return FileIndexQueryResult(entries: items, total: items.count,
+                                        totalIsExact: true, exhausted: true)
         }
         let count = try cappedCount(filter)
         return FileIndexQueryResult(entries: items, total: count.count,
-                                    totalIsExact: count.exact)
+                                    totalIsExact: count.exact, exhausted: false)
     }
 
     /// 分类 / 范围 / `folder:` `file:` / `ext:` 这些与词无关的过滤。
@@ -639,14 +724,24 @@ actor FileIndexDatabase {
     }
 
     /// 全部词的过滤；`skipping` 用于分段取时把排序那一个词换成段子句。
+    /// 不含通配符的词用 `instr` 做字面包含，不再拼 `%...%` 让 LIKE 逐行解析；
+    /// 通配词仍走 LIKE，因为 `?` / `*` 要保留模式语义。
     private func termFilter(_ query: FileIndexQuery, skipping: Int?) -> Filter {
         var filter = Filter()
         for (index, term) in query.syntax.terms.enumerated() where index != skipping {
-            let pattern = FileSearchSyntax.likePattern(for: term)
-            filter.append(term.isNegated
-                ? "name_folded NOT LIKE ? ESCAPE '\\'"
-                : "name_folded LIKE ? ESCAPE '\\'",
-                [.text(pattern)])
+            if term.hasWildcard {
+                let pattern = FileSearchSyntax.likePattern(for: term)
+                filter.append(term.isNegated
+                    ? "name_folded NOT LIKE ? ESCAPE '\\'"
+                    : "name_folded LIKE ? ESCAPE '\\'",
+                    [.text(pattern)])
+            } else {
+                let needle = FileIndexText.fold(term.text)
+                filter.append(term.isNegated
+                    ? "instr(name_folded, ?) = 0"
+                    : "instr(name_folded, ?) > 0",
+                    [.text(needle)])
+            }
         }
         return filter
     }

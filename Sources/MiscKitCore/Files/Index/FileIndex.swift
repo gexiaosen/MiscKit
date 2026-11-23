@@ -38,6 +38,10 @@ public final class FileIndex {
     @ObservationIgnored private let database: FileIndexDatabase
     /// 查询专用连接：与写连接分离，增量更新/子树重扫再忙也不会把按键的查询堵在后面。
     @ObservationIgnored private let reader: FileIndexDatabase
+    /// 补全段与计数段各自一条只读连接：包含段（最长 45ms）和计数（最长 189ms）
+    /// 都不能排在快段后面，否则“先出结果”只是把等待挪了个位置。
+    @ObservationIgnored private let bodyReader: FileIndexDatabase
+    @ObservationIgnored private let countReader: FileIndexDatabase
     @ObservationIgnored private let databaseURL: URL
     @ObservationIgnored private let overrideRoots: [URL]
     @ObservationIgnored private let isDisabled: Bool
@@ -57,6 +61,8 @@ public final class FileIndex {
     @ObservationIgnored private var isRebuilding = false
     @ObservationIgnored private var observingRoots = false
     @ObservationIgnored private var readerFailed = false
+    @ObservationIgnored private var bodyReaderFailed = false
+    @ObservationIgnored private var countReaderFailed = false
 
     private init() {
         #if DEBUG
@@ -75,6 +81,8 @@ public final class FileIndex {
         #endif
         database = FileIndexDatabase(url: databaseURL)
         reader = FileIndexDatabase(url: databaseURL, readOnly: true)
+        bodyReader = FileIndexDatabase(url: databaseURL, readOnly: true, cacheSizeKB: 16 * 1024)
+        countReader = FileIndexDatabase(url: databaseURL, readOnly: true, cacheSizeKB: 8 * 1024)
     }
 
     // MARK: 状态
@@ -532,13 +540,49 @@ public final class FileIndex {
     // MARK: 查询
 
     public func search(term: String, request: FileSearchRequest) async throws -> FileSearchResponse {
-        guard phase == .ready else { throw FileIndexError.databaseClosed }
+        try await search(term: term, request: request, phase: .complete)
+    }
+
+    public func searchFast(term: String, request: FileSearchRequest) async throws -> FileSearchResponse {
+        try await search(term: term, request: request, phase: .fast)
+    }
+
+    public func searchBody(term: String, request: FileSearchRequest) async throws -> FileSearchResponse {
+        try await search(term: term, request: request, phase: .body)
+    }
+
+    public func searchCount(term: String, request: FileSearchRequest) async throws -> FileSearchResponse {
+        try await search(term: term, request: request, phase: .count)
+    }
+
+    /// 新查询已经取代旧查询时，通知只读计数连接中止在途 count。
+    /// 只碰 `countReader`：快段/补全段是另外两条连接，不能因为换查询把首屏也停了。
+    public func interruptCountQuery() {
+        countReader.interrupt()
+    }
+
+    /// 补全段同样可能排队；换查询时让旧 body 停下，新 body 不用排在它后面。
+    /// fast 仍走独立 `reader`，不会被这里误伤。
+    public func interruptBodyQuery() {
+        bodyReader.interrupt()
+    }
+
+    private func search(term: String, request: FileSearchRequest,
+                        phase: FileIndexQueryPhase) async throws -> FileSearchResponse {
+        guard self.phase == .ready else { throw FileIndexError.databaseClosed }
         let syntax = FileSearchSyntax.parse(term)
         let query = FileIndexQuery(
             syntax: syntax, category: request.category, scope: request.scope,
             directories: request.directories, sort: request.sort,
             limit: max(request.limit, 1))
-        let result = try await readConnection().query(query)
+        let connection = await readConnection(for: phase)
+        let result = try await connection.query(query, phase: phase)
+        if phase == .count {
+            return FileSearchResponse(items: [], total: result.total,
+                                      isTruncated: !result.totalIsExact,
+                                      totalIsExact: result.totalIsExact)
+        }
+
         let items = result.entries.map { entry in
             FileItem(url: URL(fileURLWithPath: entry.path),
                      isDirectory: entry.isDirectory,
@@ -550,21 +594,46 @@ public final class FileIndex {
                      fileSize: entry.size,
                      origin: .index)
         }
-        let truncated = !result.totalIsExact || result.total > items.count
+        let truncated: Bool
+        switch phase {
+        case .fast:
+            // 快段只跑了等值 + 前缀，包含段还没扫；除非查询本来就无需分段（通配/时间排序），
+            // 否则 total 只能当下界用。
+            truncated = !result.exhausted || result.total > items.count
+        case .body:
+            truncated = !result.exhausted || result.total > items.count
+        case .complete:
+            truncated = !result.totalIsExact || result.total > items.count
+        case .count:
+            truncated = !result.totalIsExact
+        }
         return FileSearchResponse(items: items, total: result.total,
                                   isTruncated: truncated, totalIsExact: result.totalIsExact)
     }
 
     /// 只读连接按需打开：打不开（旧库还没生成、文件被换掉）就退回写连接，
     /// 慢一点但结果对。下一次搜索会再试一次，恢复了就自动回到快路径。
-    private func readConnection() async -> FileIndexDatabase {
+    private func readConnection(for phase: FileIndexQueryPhase) async -> FileIndexDatabase {
+        let connection: FileIndexDatabase
+        let failedKeyPath: ReferenceWritableKeyPath<FileIndex, Bool>
+        switch phase {
+        case .fast, .complete:
+            connection = reader
+            failedKeyPath = \.readerFailed
+        case .body:
+            connection = bodyReader
+            failedKeyPath = \.bodyReaderFailed
+        case .count:
+            connection = countReader
+            failedKeyPath = \.countReaderFailed
+        }
         do {
-            try await reader.open()
-            readerFailed = false
-            return reader
+            try await connection.open()
+            self[keyPath: failedKeyPath] = false
+            return connection
         } catch {
-            if !readerFailed {
-                readerFailed = true
+            if !self[keyPath: failedKeyPath] {
+                self[keyPath: failedKeyPath] = true
                 log.error("read connection unavailable, falling back to write connection: \(error.localizedDescription, privacy: .public)")
             }
             return database

@@ -172,6 +172,51 @@ struct FileIndexTests {
         #expect(result.totalIsExact)
     }
 
+    @Test("SQLite：fast/body/count 三阶段与完整查询同语义")
+    func databaseQueryPhases() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let db = makeDatabase(fixture)
+        try await db.open()
+
+        let names = [
+            "quote", "quote.txt", "quoted.txt", "aquote.bak",
+            "xquote.txt", "quote%2.txt", "quote_2.txt",
+            "[quote].txt", "a]quote.txt", "a_b.txt", "axb.txt",
+        ]
+        try await db.upsert(names.map { name in
+            FileIndexEntry(path: fixture.root.appendingPathComponent(name).path,
+                           name: name, isDirectory: false, ext: "txt", kind: "other")
+        })
+
+        let complete = try await db.query(query("quote"))
+        let fast = try await db.query(query("quote"), phase: .fast)
+        let body = try await db.query(query("quote"), phase: .body)
+        let count = try await db.query(query("quote"), phase: .count)
+
+        #expect(!fast.exhausted)
+        #expect(fast.entries == Array(complete.entries.prefix(fast.entries.count)))
+        #expect(fast.entries.count < complete.entries.count)
+        #expect(body.entries == complete.entries)
+        #expect(body.total == complete.total)
+        #expect(body.totalIsExact)
+        #expect(count.entries.isEmpty)
+        #expect(count.total == complete.total)
+        #expect(count.totalIsExact)
+
+        // `[` / `]` 走 GLOB 时必须被转义，否则前缀段会从有结果变成 0 条。
+        let bracket = try await db.query(query("["))
+        let bracketFast = try await db.query(query("["), phase: .fast)
+        #expect(!bracket.entries.isEmpty)
+        #expect(bracketFast.entries == Array(bracket.entries.prefix(bracketFast.entries.count)))
+
+        // 非通配词走 instr 时，`_` 和 `%` 是字面量，不能像旧 LIKE 那样被当成通配。
+        let underscore = try await db.query(query("a_b"))
+        #expect(underscore.entries.map(\.name) == ["a_b.txt"])
+        let percent = try await db.query(query("quote%2"))
+        #expect(percent.entries.map(\.name) == ["quote%2.txt"])
+    }
+
     @Test("SQLite：命中超过计数上限时只报下界")
     func databaseCountCap() async throws {
         let fixture = try makeFixture()

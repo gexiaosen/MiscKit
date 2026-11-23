@@ -37,11 +37,6 @@ struct FileSearchPane: View {
         a11y.motionDuration(Layout.Motion.staggerStep, scale: settings.motionScale)
     }
 
-    private var rollAnimation: Animation? {
-        let duration = a11y.motionDuration(Layout.Motion.numericRoll, scale: settings.motionScale)
-        return duration > 0 ? .easeOut(duration: duration) : nil
-    }
-
     private var listHeight: CGFloat {
         let rows = Layout.listHeight(rows: model.visibleRowCount, verticalPadding: Layout.Spacing.s)
         return isSplit ? max(rows, Layout.Metric.filePreviewMinHeight) : rows
@@ -300,11 +295,11 @@ struct FileSearchPane: View {
 
     private var footer: some View {
         HStack(spacing: Layout.Spacing.m) {
+            // 不要给计数加 `.contentTransition(.numericText())`：切换分类时列表高度变化，
+            // 底栏同帧下移，数字过渡会把旧文本快照留在原位置，形成"残影"。
             Text(model.isSearching ? L10n.Files.searching : model.countText)
                 .font(.system(size: 11).monospacedDigit())
                 .foregroundStyle(Theme.textBody)
-                .contentTransition(.numericText())
-                .animation(rollAnimation, value: model.countText)
             if model.selectedCount > 0 {
                 Text(L10n.Files.selectedCount(model.selectedCount))
                     .font(.system(size: 11, weight: .medium).monospacedDigit())

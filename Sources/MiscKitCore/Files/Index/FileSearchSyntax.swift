@@ -174,4 +174,21 @@ public enum FileIndexText {
             .replacingOccurrences(of: "%", with: "\\%")
             .replacingOccurrences(of: "_", with: "\\_")
     }
+
+    /// SQLite `GLOB` 没有 `ESCAPE` 子句；把通配元字符放进单字符类里转义。
+    /// `[` / `]` 也必须转义，否则用户搜 `[` 会从“有结果”变成“0 条”。
+    public static func globPrefix(_ text: String) -> String {
+        var pattern = ""
+        for character in text {
+            switch character {
+            case "*", "?", "[", "]":
+                pattern.append("[")
+                pattern.append(character)
+                pattern.append("]")
+            default:
+                pattern.append(character)
+            }
+        }
+        return pattern + "*"
+    }
 }

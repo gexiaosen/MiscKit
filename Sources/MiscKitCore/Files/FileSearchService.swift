@@ -27,11 +27,19 @@ public final class FileSearchService {
     public static let shared = FileSearchService()
 
     private var activeQuery: NSMetadataQuery?
+    /// 冷启动按目录扇出时的多个查询；新搜索开始时一并停掉。
+    private var scopedColdQueries: [NSMetadataQuery] = []
     /// 只写 `true`：探针的"能用"是稳定结论，"不能用"可能只是 Spotlight 还没热，见 `prewarmSpotlightAvailability`。
     private var spotlightAvailable: Bool?
     private var lastNegativeProbeAt: Date?
     private var availabilityTask: Task<Bool, Never>?
     private var querySequence = 0
+    /// 只用于中断在途 body/count：有新的输入/分类切换时，旧结果本来就会被 token 丢掉，
+    /// 这里再把 SQLite 里的旧查询停掉，避免它们排队挡住新查询。
+    private var bodyQueryToken = 0
+    private var bodyQueryActive = false
+    private var countQueryToken = 0
+    private var countQueryActive = false
     private static let negativeProbeRetry: TimeInterval = 30
     private let log = Logger(subsystem: "app.misckit.launcher", category: "filesearch")
 
@@ -47,18 +55,88 @@ public final class FileSearchService {
         case .path(let path):
             return resolve(path: path, request: request)
         case .search(let term):
-            FileIndex.shared.prepareForSearch()
-            // 「还没就绪」不等于「坏了」：冷启动第一次搜索几乎必然撞上 .idle/.opening，
-            // 立刻掉到兜底就永远看不到索引结果。实测打开 + 计数 4.9ms，等一拍代价极低。
+            // 索引就绪时只走 SQLite；未就绪时让 Spotlight 和索引并行，谁先有非空结果谁先上屏。
             if !FileIndex.shared.isReady {
-                _ = await FileIndex.shared.waitForReady(timeout: .milliseconds(1200))
+                return await coldStartSearch(term: term, request: request)
             }
-            if FileIndex.shared.isReady,
-               let indexed = await searchIndex(term: term, request: request) {
+            FileIndex.shared.prepareForSearch()
+            if let indexed = await searchIndex(term: term, request: request) {
                 return indexed
             }
             return await searchSpotlight(term: term, request: request)
         }
+    }
+
+    /// 索引未就绪：Spotlight 立刻开跑，同时等索引打开。谁先给出非空结果谁上屏；
+    /// 索引落后时先返回 Spotlight，之后 FileSearchModel.observeIndexPhase 会在索引 ready
+    /// 后用索引结果覆盖。两边都空时最多等 1.2s，和原来的兜底等待一致。
+    private func coldStartSearch(term: String, request: FileSearchRequest) async -> FileSearchResponse {
+        let entered = Date()
+        var spotlight: FileSearchResponse?
+        let spotlightTask = Task { @MainActor [self] in
+            let response = await searchSpotlight(term: term, request: request, earlyResultCount: 1)
+            spotlight = response
+            return response
+        }
+        // 先把 Spotlight 任务排上，再开索引：索引 open/count 会占主线程一小段时间，
+        // 反过来先开索引会让首条白白晚上几十毫秒。给 Spotlight 一个 60ms 的抢跑窗口，
+        // 但最多只延后 60ms，索引仍能在 1.2s 兜底前 ready。
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(60))
+            FileIndex.shared.prepareForSearch()
+        }
+        let deadline = ContinuousClock.now + .milliseconds(1200)
+        var triedIndex = false
+
+        while ContinuousClock.now < deadline {
+            if let spotlight, !spotlight.items.isEmpty {
+                traceColdRace(winner: "spotlight", started: entered, term: term)
+                return spotlight
+            }
+            if FileIndex.shared.isReady, !triedIndex {
+                triedIndex = true
+                if let indexed = await searchIndex(term: term, request: request) {
+                    spotlightTask.cancel()
+                    traceColdRace(winner: "index", started: entered, term: term)
+                    return indexed
+                }
+                // 索引查询失败时不要把 Spotlight 一起取消：它仍可能给出可用结果。
+            }
+            // 只有 idle/opening/ready 还有“马上就好”的可能；building/failed/disabled 不该再等。
+            switch FileIndex.shared.phase {
+            case .idle, .opening, .ready:
+                break
+            case .building, .disabled, .failed:
+                var spotlightResult: FileSearchResponse?
+                if let spotlight { spotlightResult = spotlight }
+                spotlightTask.cancel()
+                if let spotlightResult { return spotlightResult }
+                return await spotlightTask.value
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+
+        spotlightTask.cancel()
+        if FileIndex.shared.isReady, !triedIndex,
+           let indexed = await searchIndex(term: term, request: request) {
+            traceColdRace(winner: "index", started: entered, term: term)
+            return indexed
+        }
+        if let spotlight {
+            traceColdRace(winner: "spotlight-empty", started: entered, term: term)
+            return spotlight
+        }
+        let empty = await spotlightTask.value
+        traceColdRace(winner: "empty", started: entered, term: term)
+        return empty
+    }
+
+    private func traceColdRace(winner: String, started: Date, term: String) {
+        Breadcrumbs.event("file.search.cold", [
+            "winner": winner,
+            "ms": String(Int(Date().timeIntervalSince(started) * 1000)),
+            "termLen": String(term.count),
+        ])
     }
 
     /// 索引就绪后的主路径：查询直接走 SQLite，不再启动 Spotlight。
@@ -76,6 +154,91 @@ public final class FileSearchService {
             traceSearch(via: "index-error", started: started, count: 0, term: term)
             return nil
         }
+    }
+
+    // MARK: 分段查询
+
+    /// 快段：只查等值 + 前缀，先让第一屏有内容。索引没就绪时返回 nil，
+    /// 由 `search()` 继续走原来的等待/Spotlight 兜底。
+    public func searchFast(_ request: FileSearchRequest) async -> FileSearchResponse? {
+        await searchIndexPhase(request, phase: .fast)
+    }
+
+    /// 补全段：把包含段加到快段后面。
+    public func searchBody(_ request: FileSearchRequest) async -> FileSearchResponse? {
+        await searchIndexPhase(request, phase: .body)
+    }
+
+    /// 计数段：只返回 total / totalIsExact，items 为空。
+    public func searchCount(_ request: FileSearchRequest) async -> FileSearchResponse? {
+        await searchIndexPhase(request, phase: .count)
+    }
+
+    /// 调度层开始新查询时调用。只在确有 body/count 在途时才向连接发 interrupt；
+    /// 没有在途查询时保持 no-op，避免把中断标志留给下一条 SQL。
+    public func cancelPendingQueries() {
+        if bodyQueryActive { FileIndex.shared.interruptBodyQuery() }
+        if countQueryActive { FileIndex.shared.interruptCountQuery() }
+    }
+
+    private func searchIndexPhase(_ request: FileSearchRequest,
+                                  phase: FileIndexQueryPhase) async -> FileSearchResponse? {
+        let parser = FileQueryParser(aliases: FileAliasStore.shared.aliases)
+        guard case .search(let term) = parser.parse(request.text),
+              FileIndex.shared.isReady else { return nil }
+        let bodyToken = phase == .body ? beginBodyQuery() : nil
+        let countToken = phase == .count ? beginCountQuery() : nil
+        defer {
+            if let bodyToken { endBodyQuery(bodyToken) }
+            if let countToken { endCountQuery(countToken) }
+        }
+        let started = Date()
+        do {
+            let response: FileSearchResponse
+            switch phase {
+            case .fast:
+                response = try await FileIndex.shared.searchFast(term: term, request: request)
+            case .body:
+                response = try await FileIndex.shared.searchBody(term: term, request: request)
+            case .count:
+                response = try await FileIndex.shared.searchCount(term: term, request: request)
+            case .complete:
+                response = try await FileIndex.shared.search(term: term, request: request)
+            }
+            let via = "index-\(phase)"
+            debugLog(String(format: "%@ term=%@ count=%ld total=%ld %.1fms",
+                            via, term, response.items.count, response.total,
+                            Date().timeIntervalSince(started) * 1000))
+            traceSearch(via: via, started: started, count: response.items.count, term: term)
+            return response
+        } catch {
+            log.error("\(String(describing: phase)) query failed: \(error.localizedDescription, privacy: .public)")
+            traceSearch(via: "index-\(phase)-error", started: started, count: 0, term: term)
+            return nil
+        }
+    }
+
+    /// 每次 body/count 拿一个序号；旧查询的 defer 不能把新查询的 active 状态清掉。
+    private func beginBodyQuery() -> Int {
+        bodyQueryToken += 1
+        bodyQueryActive = true
+        return bodyQueryToken
+    }
+
+    private func endBodyQuery(_ token: Int) {
+        guard bodyQueryToken == token else { return }
+        bodyQueryActive = false
+    }
+
+    private func beginCountQuery() -> Int {
+        countQueryToken += 1
+        countQueryActive = true
+        return countQueryToken
+    }
+
+    private func endCountQuery(_ token: Int) {
+        guard countQueryToken == token else { return }
+        countQueryActive = false
     }
 
     /// 每次搜索走哪条路、多久、几条——打包版也要有读数，否则"搜索中…"卡住时无从下手。
@@ -165,18 +328,17 @@ public final class FileSearchService {
 
     // MARK: Spotlight
 
-    private func searchSpotlight(term: String, request: FileSearchRequest) async -> FileSearchResponse {
+    private func searchSpotlight(term: String, request: FileSearchRequest,
+                                 earlyResultCount: Int = 0) async -> FileSearchResponse {
         let entered = Date()
-        HiddenFileIndex.shared.start()
-
-        let hidden = HiddenFileIndex.shared.search(term: term, category: request.category)
-        guard await isSpotlightAvailable() else {
-            let limited = Array(hidden.prefix(request.limit))
-            traceSearch(via: "spot-off", started: entered, count: limited.count, term: term)
-            return FileSearchResponse(
-                items: limited, total: hidden.count, isTruncated: hidden.count > limited.count,
-                notice: L10n.Files.Notice.spotlightDisabled,
-                isSpotlightAvailable: false)
+        let hidden: [FileItem]
+        if earlyResultCount > 0 {
+            // 冷启动首屏先让 Spotlight 跑起来；dotfiles 扫描是同步的，放到索引 ready 后的
+            // 常规查询里再做，否则会把这 50ms 的首条窗口白白吃掉。
+            hidden = []
+        } else {
+            HiddenFileIndex.shared.start()
+            hidden = HiddenFileIndex.shared.search(term: term, category: request.category)
         }
 
         let scopes: [Any]
@@ -198,8 +360,21 @@ public final class FileSearchService {
         let sequence = querySequence
         let started = Date()
         let result = await runQuery(predicate: makePredicate(term: term, category: request.category),
-                                    scopes: scopes, sort: request.sort, limit: request.limit)
+                                    scopes: scopes, sort: request.sort, limit: request.limit,
+                                    earlyResultCount: earlyResultCount)
         if Task.isCancelled { return FileSearchResponse(items: [], total: 0, isTruncated: false) }
+
+        // 冷启动时 Spotlight 能力探针可能比查询本身还慢；先看查询有没有命中，
+        // 只有 0 命中时才需要探针区分“没结果”和“Spotlight 被关掉”。
+        let spotlightAvailable = result.total > 0 ? true : await isSpotlightAvailable()
+        if !spotlightAvailable {
+            let limited = Array(hidden.prefix(request.limit))
+            traceSearch(via: "spot-off", started: entered, count: limited.count, term: term)
+            return FileSearchResponse(
+                items: limited, total: hidden.count, isTruncated: hidden.count > limited.count,
+                notice: L10n.Files.Notice.spotlightDisabled,
+                isSpotlightAvailable: false)
+        }
 
         debugLog(String(format: "file query#%ld term=%@ scope=%@ count=%ld spotlight=%.1fms",
                         sequence, term, request.scope.rawValue, result.total,
@@ -223,7 +398,8 @@ public final class FileSearchService {
         let limited = Array(items.prefix(request.limit))
         let notice = result.timedOut ? L10n.Files.Notice.spotlightTimeout : scopeNotice
         return FileSearchResponse(items: limited, total: total,
-                                  isTruncated: total > limited.count,
+                                  isTruncated: result.partial || total > limited.count,
+                                  totalIsExact: !result.partial && total <= limited.count,
                                   notice: notice, isSpotlightAvailable: true)
     }
 
@@ -231,43 +407,136 @@ public final class FileSearchService {
         let items: [FileItem]
         let total: Int
         let timedOut: Bool
+        var partial = false
     }
 
     private func runQuery(predicate: NSPredicate, scopes: [Any], sort: FileSort,
-                          limit: Int) async -> QueryResult {
+                          limit: Int, earlyResultCount: Int = 0) async -> QueryResult {
         activeQuery?.stop()
+        stopScopedColdQueries()
+        if earlyResultCount > 0, scopes.count > 1 {
+            return await runScopedQueries(predicate: predicate, scopes: scopes, limit: limit)
+        }
 
         let query = NSMetadataQuery()
         query.predicate = predicate
         query.searchScopes = scopes
-        query.sortDescriptors = sortDescriptors(for: sort)
+        // 冷启动预览不要带 sortDescriptors：按修改时间排序会逼 Spotlight 先收齐元数据，
+        // 首条从 ~60ms 掉到 200ms+。先拿一批结果，回来按本地字段排一次，索引 ready 后再精确替换。
+        query.sortDescriptors = earlyResultCount > 0 ? [] : sortDescriptors(for: sort)
         query.notificationBatchingInterval = 0.05
         activeQuery = query
         query.start()
 
         let deadline = ContinuousClock.now + .seconds(4)
+        // 冷启动只等第一批结果：NSMetadataQuery 在 gathering 期间就已经能取到结果，
+        // 等它彻底收完反而要多花几百毫秒。partial 会让 footer 显示 "+"，索引 ready 后覆盖。
         while query.isGathering && ContinuousClock.now < deadline {
             if Task.isCancelled {
                 query.stop()
                 if activeQuery === query { activeQuery = nil }
                 return QueryResult(items: [], total: 0, timedOut: false)
             }
+            if earlyResultCount > 0, query.resultCount >= earlyResultCount {
+                let snapshot = snapshot(query, limit: limit, preview: true)
+                query.stop()
+                if activeQuery === query { activeQuery = nil }
+                return QueryResult(items: snapshot.items, total: snapshot.total,
+                                   timedOut: false, partial: true)
+            }
             try? await Task.sleep(for: .milliseconds(15))
         }
 
         let timedOut = query.isGathering
+        let snapshot = snapshot(query, limit: limit)
+        query.stop()
+        if activeQuery === query { activeQuery = nil }
+        return QueryResult(items: snapshot.items, total: snapshot.total, timedOut: timedOut)
+    }
+
+    private func snapshot(_ query: NSMetadataQuery, limit: Int,
+                          preview: Bool = false) -> (items: [FileItem], total: Int) {
         let total = query.resultCount
         let count = min(total, limit)
         var items: [FileItem] = []
         items.reserveCapacity(count)
         for index in 0..<count {
-            guard let metadata = query.result(at: index) as? NSMetadataItem,
-                  let item = makeItem(metadata) else { continue }
-            items.append(item)
+            guard let metadata = query.result(at: index) as? NSMetadataItem else { continue }
+            let item = preview ? makePreviewItem(metadata) : makeItem(metadata)
+            if let item { items.append(item) }
         }
-        query.stop()
-        if activeQuery === query { activeQuery = nil }
-        return QueryResult(items: items, total: total, timedOut: timedOut)
+        return (items, total)
+    }
+
+    /// 多个 folders 根目录时逐个开查询，而不是一个 query 带 3 个 scope：
+    /// Spotlight 对多 scope 的首条要等各目录都回话；单目录 Desktop 约 50ms 就有结果，
+    /// 翼支付约 50ms，Downloads 约 100ms。谁先回非空就先上屏，其余取消。
+    /// NSMetadataQuery 的 scope 是 `Any`（URL 或 LocalComputerScope 常量），本身不可变；
+    /// 用这个盒子只为了跨 task 边界时不触发 Swift 6 的 Sendable 检查。
+    private struct ScopeBox: @unchecked Sendable {
+        let value: Any
+    }
+
+    private struct QuerySpec: @unchecked Sendable {
+        let predicate: NSPredicate
+        let limit: Int
+    }
+
+    private func runScopedQueries(predicate: NSPredicate, scopes: [Any], limit: Int) async -> QueryResult {
+        let boxes = scopes.map(ScopeBox.init(value:))
+        let spec = QuerySpec(predicate: predicate, limit: limit)
+        return await withTaskGroup(of: QueryResult.self) { group in
+            for box in boxes {
+                group.addTask { [weak self, spec] in
+                    guard let self else { return QueryResult(items: [], total: 0, timedOut: false) }
+                    return await self.runSingleScopedQuery(spec: spec, scope: box.value)
+                }
+            }
+            var firstNonEmpty: QueryResult?
+            for await result in group {
+                if result.total > 0 {
+                    firstNonEmpty = result
+                    group.cancelAll()
+                    break
+                }
+            }
+            return firstNonEmpty ?? QueryResult(items: [], total: 0, timedOut: false)
+        }
+    }
+
+    private func runSingleScopedQuery(spec: QuerySpec, scope: Any) async -> QueryResult {
+        let query = NSMetadataQuery()
+        query.predicate = spec.predicate
+        query.searchScopes = [scope]
+        query.notificationBatchingInterval = 0.02
+        scopedColdQueries.append(query)
+        defer {
+            query.stop()
+            scopedColdQueries.removeAll { $0 === query }
+        }
+        query.start()
+
+        let deadline = ContinuousClock.now + .milliseconds(600)
+        while ContinuousClock.now < deadline {
+            if Task.isCancelled {
+                return QueryResult(items: [], total: 0, timedOut: false)
+            }
+            if query.resultCount > 0 {
+                let snapshot = snapshot(query, limit: spec.limit, preview: true)
+                return QueryResult(items: snapshot.items, total: snapshot.total,
+                                   timedOut: false, partial: true)
+            }
+            if !query.isGathering { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        let snapshot = snapshot(query, limit: spec.limit, preview: true)
+        return QueryResult(items: snapshot.items, total: snapshot.total,
+                           timedOut: false, partial: true)
+    }
+
+    private func stopScopedColdQueries() {
+        for query in scopedColdQueries { query.stop() }
+        scopedColdQueries.removeAll()
     }
 
     private func makePredicate(term: String, category: FileCategory) -> NSPredicate {
@@ -374,6 +643,25 @@ public final class FileSearchService {
             fileSize: (metadata.value(forAttribute: NSMetadataItemFSSizeKey) as? NSNumber)?.int64Value,
             isUbiquitous: isUbiquitous,
             isDownloaded: downloaded,
+            origin: .spotlight)
+    }
+
+    /// 冷启动首屏只读 Spotlight 已经给的元数据：`makeItem` 里的 resourceValues
+    /// 会逐条碰磁盘，15 条也能吃掉几十毫秒。索引 ready 后会被完整结果替换。
+    private func makePreviewItem(_ metadata: NSMetadataItem) -> FileItem? {
+        guard let path = metadata.value(forAttribute: NSMetadataItemPathKey) as? String else { return nil }
+        let tree = metadata.value(forAttribute: NSMetadataItemContentTypeTreeKey) as? [String] ?? []
+        return FileItem(
+            url: URL(fileURLWithPath: path),
+            isDirectory: tree.contains("public.folder"),
+            contentType: metadata.value(forAttribute: NSMetadataItemContentTypeKey) as? String,
+            contentTypeTree: tree,
+            creationDate: metadata.value(forAttribute: NSMetadataItemFSCreationDateKey) as? Date,
+            modificationDate: metadata.value(forAttribute: NSMetadataItemFSContentChangeDateKey) as? Date,
+            lastUsedDate: metadata.value(forAttribute: NSMetadataItemLastUsedDateKey) as? Date,
+            fileSize: (metadata.value(forAttribute: NSMetadataItemFSSizeKey) as? NSNumber)?.int64Value,
+            isUbiquitous: (metadata.value(forAttribute: NSMetadataItemIsUbiquitousKey) as? Bool) ?? false,
+            isDownloaded: true,
             origin: .spotlight)
     }
 
