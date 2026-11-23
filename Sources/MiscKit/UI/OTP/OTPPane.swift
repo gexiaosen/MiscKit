@@ -261,6 +261,9 @@ struct OTPPane: View {
                 .foregroundStyle(Theme.textBody)
                 .padding(.horizontal, Layout.SpacingValue.rowPadding)
                 .padding(.top, Layout.Spacing.xs)
+                // TimelineView 会把子视图按自身默认对齐方式摆放；显式撑满再左对齐，
+                // 避免分组标题被居中到列表中线。
+                .frame(maxWidth: .infinity, alignment: .leading)
         )
     }
 
