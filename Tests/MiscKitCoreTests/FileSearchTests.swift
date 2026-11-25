@@ -55,8 +55,8 @@ struct FileSearchTests {
         let volume = URL(fileURLWithPath: "/Volumes/Work Disk")
         let parser = FileQueryParser(home: fixture.root, volumes: [volume])
 
-        #expect(parser.parse("Work Disk") == .path(PathQuery(
-            url: volume, listsChildren: false, exists: true)))
+        #expect(parser.parse("Work Disk") == .search(term: "Work Disk"))
+        #expect(!parser.isFileMode("Work Disk"), "裸卷名不再把面板切进文件模式")
         guard case .path(let query) = parser.parse("Work Disk/Projects/") else {
             Issue.record("卷标路径没有命中")
             return
@@ -65,6 +65,18 @@ struct FileSearchTests {
         #expect(query.listsChildren)
         // 卷本身在测试机上不存在，exists 允许为 false；关键是没走模糊搜索
         #expect(!query.exists)
+    }
+
+    @Test("裸卷名不劫持同名应用：安装 DMG 的卷不把「千问」当路径")
+    func bareVolumeNameDoesNotHijackApp() throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let parser = FileQueryParser(
+            home: fixture.root, volumes: [URL(fileURLWithPath: "/Volumes/千问")])
+
+        #expect(parser.parse("千问") == .search(term: "千问"))
+        #expect(!parser.isFileMode("千问"), "敲应用名不该被挂载卷带进文件面板")
+        #expect(parser.isFileMode("千问/"), "带斜杠仍然直达卷")
     }
 
     @Test("目录别名优先于同名模糊搜索")

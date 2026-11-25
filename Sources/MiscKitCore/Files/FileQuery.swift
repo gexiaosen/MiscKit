@@ -118,9 +118,9 @@ public struct FileQueryParser: Sendable {
         for volume in volumes.sorted(by: { $0.path.count > $1.path.count }) {
             let name = volume.lastPathComponent
             guard !name.isEmpty else { continue }
-            if body.compare(name, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame {
-                return PathQuery(url: clean(volume), listsChildren: false, exists: true)
-            }
+            // 裸卷名不抢应用搜索：安装用 DMG 的挂载卷常和 App 同名
+            // （千问.dmg → /Volumes/千问），敲「千问」会被带进文件面板。
+            // 卷名后跟 `/` 仍然直达。
             let prefix = name + "/"
             guard body.lowercased().hasPrefix(prefix.lowercased()) else { continue }
             let tail = String(body.dropFirst(prefix.count))
