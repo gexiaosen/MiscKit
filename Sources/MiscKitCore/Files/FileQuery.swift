@@ -54,6 +54,7 @@ public struct FileQueryParser: Sendable {
             return .path(PathQuery(url: clean(aliasURL), listsChildren: false,
                                    exists: fileExists(aliasURL)))
         }
+        if Self.hasFilterSyntax(body) { return .search(term: body) }
         if let query = volumePath(body) { return .path(query) }
         if isPathLike(body) {
             let url = expand(body)
@@ -68,8 +69,33 @@ public struct FileQueryParser: Sendable {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         if Self.stripKeyword(trimmed) != nil { return true }
+        // `ext:` / `in:` / `path:` / `re:` 这些语法只在文件搜索里有意义，
+        // 不带 `file` 前缀也应该切到文件搜索面板，否则功能等于不可达。
+        if Self.hasFilterSyntax(trimmed) { return true }
+        if FileSearchSyntax.parse(trimmed).regex != nil { return true }
         if case .path = parse(trimmed) { return true }
         return false
+    }
+
+    /// 路径直达失败时的回退词：去掉 `file` 关键词，保留查询主体。
+    public func searchTerm(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let rest = Self.stripKeyword(trimmed) {
+            return rest.isEmpty ? nil : rest
+        }
+        return trimmed
+    }
+
+    /// `in:` / `path:` / `ext:` / `re:` 这些是语法，不是路径。
+    /// 不先拦下来，`path:src/main` 会被当成一条不存在的路径。
+    private static func hasFilterSyntax(_ text: String) -> Bool {
+        let filters = ["in:", "path:", "ext:", "folder:", "dir:", "file:",
+                       "re:", "regex:", "在:", "路径:", "类型:", "文件夹:", "文件:"]
+        return text.split(whereSeparator: \.isWhitespace).contains { token in
+            let lower = token.lowercased()
+            return filters.contains { lower.hasPrefix($0) }
+        }
     }
 
     /// `file 报价` → `报价`；`文件` → 空串；普通查询返回 nil。
@@ -293,7 +319,7 @@ public struct FileSearchResponse: Sendable {
     public let items: [FileItem]
     public let total: Int
     public let isTruncated: Bool
-    /// 命中数超过计数上限时 `total` 只是下界，界面显示「1000+」而不是一个精确数字。
+    /// 命中数超过计数上限时 `total` 只是下界，界面显示「300+」而不是一个精确数字。
     public let totalIsExact: Bool
     public let notice: String?
     public let isSpotlightAvailable: Bool

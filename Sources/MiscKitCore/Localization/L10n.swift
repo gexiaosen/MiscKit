@@ -554,6 +554,9 @@ public enum L10n {
             public static var emptyFoldersFallback: String { L10n.tr("files.notice.emptyFoldersFallback") }
             public static var emptyQuery: String { L10n.tr("files.notice.emptyQuery") }
             public static func missingPath(_ path: String) -> String { L10n.format("files.notice.missingPath", path) }
+            public static var regexAnchor: String { L10n.tr("files.notice.regexAnchor") }
+            public static var regexInvalid: String { L10n.tr("files.notice.regexInvalid") }
+            public static var regexUnavailable: String { L10n.tr("files.notice.regexUnavailable") }
             public static var spotlightDisabled: String { L10n.tr("files.notice.spotlightDisabled") }
             public static var spotlightTimeout: String { L10n.tr("files.notice.spotlightTimeout") }
             public static func unreadableDir(_ path: String) -> String { L10n.format("files.notice.unreadableDir", path) }

@@ -9,15 +9,19 @@ public struct FileSearchRequest: Sendable {
     public var directories: [URL]
     public var sort: FileSort
     public var limit: Int
+    /// 路径直达失败后的回退：只搜完整路径，不搜文件名。
+    public var pathSearch: Bool
 
     public init(text: String, category: FileCategory = .all, scope: FileScope = .mac,
-                directories: [URL] = [], sort: FileSort = .relevance, limit: Int = 80) {
+                directories: [URL] = [], sort: FileSort = .relevance, limit: Int = 80,
+                pathSearch: Bool = false) {
         self.text = text
         self.category = category
         self.scope = scope
         self.directories = directories
         self.sort = sort
         self.limit = limit
+        self.pathSearch = pathSearch
     }
 }
 
@@ -46,6 +50,18 @@ public final class FileSearchService {
     private init() {}
 
     public func search(_ request: FileSearchRequest) async -> FileSearchResponse {
+        // 正则不是 SQL 能表达的东西，必须走索引的精筛通道；索引没就绪时如实说明。
+        if FileSearchSyntax.parse(request.text).regex != nil {
+            guard FileIndex.shared.isReady else {
+                return FileSearchResponse(items: [], total: 0, isTruncated: false,
+                                          notice: L10n.Files.Notice.regexUnavailable)
+            }
+            FileIndex.shared.prepareForSearch()
+            if let indexed = await searchIndex(term: request.text, request: request) {
+                return indexed
+            }
+        }
+
         let parser = FileQueryParser(aliases: FileAliasStore.shared.aliases)
         switch parser.parse(request.text) {
         case .none:
@@ -53,6 +69,17 @@ public final class FileSearchService {
         case .browse:
             return browseHistory(request)
         case .path(let path):
+            // 路径不存在时不再只给一句“找不到”：`src/main` 这类半截路径改走索引的路径段搜索。
+            if !path.exists, let body = parser.searchTerm(request.text),
+               body.contains("/") || body.hasPrefix("~") {
+                var fallback = request
+                fallback.pathSearch = true
+                if FileIndex.shared.isReady,
+                   let indexed = await searchIndex(term: body, request: fallback),
+                   !indexed.items.isEmpty {
+                    return indexed
+                }
+            }
             return resolve(path: path, request: request)
         case .search(let term):
             // 索引就绪时只走 SQLite；未就绪时让 Spotlight 和索引并行，谁先有非空结果谁先上屏。
@@ -185,6 +212,7 @@ public final class FileSearchService {
                                   phase: FileIndexQueryPhase) async -> FileSearchResponse? {
         let parser = FileQueryParser(aliases: FileAliasStore.shared.aliases)
         guard case .search(let term) = parser.parse(request.text),
+              FileSearchSyntax.parse(term).regex == nil,
               FileIndex.shared.isReady else { return nil }
         let bodyToken = phase == .body ? beginBodyQuery() : nil
         let countToken = phase == .count ? beginCountQuery() : nil

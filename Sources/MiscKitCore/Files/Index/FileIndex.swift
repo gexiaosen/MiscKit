@@ -34,6 +34,9 @@ public final class FileIndex {
     public private(set) var scannedCount = 0
     public private(set) var currentPath: String?
     public private(set) var lastError: String?
+    /// FTS 是否可用：读写四条连接必须看同一个事实，所以由这里统一持有。
+    /// 重建/整库交换期间为假，包含段回退到 `instr`（慢但结果对）。
+    public private(set) var isFTSReady = false
 
     @ObservationIgnored private let database: FileIndexDatabase
     /// 查询专用连接：与写连接分离，增量更新/子树重扫再忙也不会把按键的查询堵在后面。
@@ -63,6 +66,9 @@ public final class FileIndex {
     @ObservationIgnored private var readerFailed = false
     @ObservationIgnored private var bodyReaderFailed = false
     @ObservationIgnored private var countReaderFailed = false
+    @ObservationIgnored private var ftsTask: Task<Void, Never>?
+    @ObservationIgnored private var maintenanceTask: Task<Void, Never>?
+    @ObservationIgnored private var lastQueryAt: ContinuousClock.Instant?
 
     private init() {
         #if DEBUG
@@ -149,7 +155,7 @@ public final class FileIndex {
         let paths = urls.map(\.path)
         if isRebuilding { deferredDeletions.formUnion(paths) }
         do {
-            try await database.apply(upserts: [], deleting: paths)
+            try await database.apply(upserts: [], deleting: paths, maintainFTS: isFTSReady)
             indexedCount = try await database.count()
         } catch {
             lastError = error.localizedDescription
@@ -180,6 +186,13 @@ public final class FileIndex {
                 indexedCount = entries
                 scannedCount = entries
                 phase = .ready
+                isFTSReady = try await database.meta(FileIndexMetaKey.ftsReady) == "1"
+                if isFTSReady, try await database.ftsRowCount() != entries {
+                    // 行数对不上说明有事务外写入或上次重建被打断，重建一遍再开。
+                    isFTSReady = false
+                }
+                if !isFTSReady { scheduleFTSRebuild() }
+                scheduleMaintenance()
                 let saved = try await database.meta(FileIndexMetaKey.lastEventID).flatMap(UInt64.init)
                 startEvents(since: saved ?? FSEventsGetCurrentEventId())
                 debugLog("index ready entries=\(entries) roots=\(roots.count)")
@@ -219,6 +232,11 @@ public final class FileIndex {
         guard !isRebuilding else {
             rebuildRequested = true
             return
+        }
+        // FTS 重建占着写连接且按 id 区间扫表；等它收工再换整库，避免把增量写丢。
+        if let ftsTask {
+            await ftsTask.value
+            self.ftsTask = nil
         }
         isRebuilding = true
         defer { isRebuilding = false }
@@ -270,10 +288,11 @@ public final class FileIndex {
             indexedCount = try await database.count()
             scannedCount = result.inserted
             currentPath = nil
-            if !keepServing {
-                phase = .ready
-                try? await database.reclaimSpaceIfNeeded()
-            }
+            // 整库交换已经把 FTS 清空，后台补建；补建期间包含段回退 instr。
+            isFTSReady = false
+            if !keepServing { phase = .ready }
+            scheduleFTSRebuild()
+            scheduleMaintenance()
             debugLog("full scan done entries=\(indexedCount) inserted=\(result.inserted) "
                      + "unreadable=\(result.unreadable) serving=\(keepServing)")
 
@@ -394,6 +413,12 @@ public final class FileIndex {
 
     private func applyPending() async {
         guard phase == .ready, !isApplying, !isRebuilding else { return }
+        // FTS 重建和增量写入共用写连接，且重建按 id 区间扫表；
+        // 这时插进来的增量会被跳过，等重建收工再排空队列。
+        guard ftsTask == nil else {
+            scheduleApply(delay: .seconds(1))
+            return
+        }
         // 已经在服务（SQLite 里有可用行）时，任何重建都只走背后，不打断搜索；
         // 只有从未就绪过的冷启才让界面显示"正在建立文件索引"。
         let serving = indexedCount > 0
@@ -447,7 +472,8 @@ public final class FileIndex {
 
         do {
             if !plan.deletions.isEmpty {
-                try await database.apply(upserts: [], deleting: Array(plan.deletions))
+                try await database.apply(upserts: [], deleting: Array(plan.deletions),
+                                         maintainFTS: isFTSReady)
             }
 
             let refreshed = await Task.detached(priority: .utility) {
@@ -456,10 +482,11 @@ public final class FileIndex {
             let entries = refreshed.entries
             let vanished = refreshed.vanished
             if !vanished.isEmpty {
-                try await database.apply(upserts: [], deleting: vanished)
+                try await database.apply(upserts: [], deleting: vanished,
+                                         maintainFTS: isFTSReady)
             }
             if !entries.isEmpty {
-                try await database.upsert(entries)
+                try await database.upsert(entries, maintainFTS: isFTSReady)
             }
 
             let policy = makePolicy()
@@ -471,7 +498,7 @@ public final class FileIndex {
                 _ = try await FileIndexScanner.scan(
                     roots: [URL(fileURLWithPath: path)], into: database, policy: policy,
                     staging: true)
-                try await database.publishStagingSubtree(path)
+                try await database.publishStagingSubtree(path, maintainFTS: isFTSReady)
             }
 
             try await database.setMeta(FileIndexMetaKey.lastEventID, value: String(plan.maxEventID))
@@ -540,7 +567,10 @@ public final class FileIndex {
     // MARK: 查询
 
     public func search(term: String, request: FileSearchRequest) async throws -> FileSearchResponse {
-        try await search(term: term, request: request, phase: .complete)
+        if let regex = FileSearchSyntax.parse(term).regex {
+            return try await regexSearch(regex: regex, request: request)
+        }
+        return try await search(term: term, request: request, phase: .complete)
     }
 
     public func searchFast(term: String, request: FileSearchRequest) async throws -> FileSearchResponse {
@@ -570,30 +600,21 @@ public final class FileIndex {
     private func search(term: String, request: FileSearchRequest,
                         phase: FileIndexQueryPhase) async throws -> FileSearchResponse {
         guard self.phase == .ready else { throw FileIndexError.databaseClosed }
+        lastQueryAt = ContinuousClock.now
         let syntax = FileSearchSyntax.parse(term)
         let query = FileIndexQuery(
             syntax: syntax, category: request.category, scope: request.scope,
             directories: request.directories, sort: request.sort,
-            limit: max(request.limit, 1))
+            limit: max(request.limit, 1), pathSearch: request.pathSearch)
         let connection = await readConnection(for: phase)
-        let result = try await connection.query(query, phase: phase)
+        let result = try await connection.query(query, phase: phase, usingFTS: isFTSReady)
         if phase == .count {
             return FileSearchResponse(items: [], total: result.total,
                                       isTruncated: !result.totalIsExact,
                                       totalIsExact: result.totalIsExact)
         }
 
-        let items = result.entries.map { entry in
-            FileItem(url: URL(fileURLWithPath: entry.path),
-                     isDirectory: entry.isDirectory,
-                     contentType: nil,
-                     contentTypeTree: entry.isDirectory ? ["public.folder"] : [],
-                     creationDate: entry.created,
-                     modificationDate: entry.modified,
-                     lastUsedDate: entry.lastUsed,
-                     fileSize: entry.size,
-                     origin: .index)
-        }
+        let items = makeItems(from: result.entries)
         let truncated: Bool
         switch phase {
         case .fast:
@@ -637,6 +658,109 @@ public final class FileIndex {
                 log.error("read connection unavailable, falling back to write connection: \(error.localizedDescription, privacy: .public)")
             }
             return database
+        }
+    }
+
+    // MARK: FTS 与维护
+
+    /// 重建排队：整库交换、首次建库、迁移之后都要补一次。
+    /// 这段时间 `isFTSReady` 为假，包含段走 `instr`，结果仍然对。
+    private func scheduleFTSRebuild() {
+        guard !isFTSReady, ftsTask == nil, phase == .ready else { return }
+        ftsTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.database.rebuildFTS()
+                self.isFTSReady = true
+                self.lastError = nil
+                self.debugLog("fts rebuilt rows=\(self.indexedCount)")
+            } catch {
+                self.lastError = error.localizedDescription
+                self.log.error("fts rebuild failed: \(error.localizedDescription, privacy: .public)")
+            }
+            self.ftsTask = nil
+            // 重建期间积压的增量现在才能落库。
+            self.scheduleApply(delay: .milliseconds(200))
+            self.scheduleMaintenance()
+        }
+    }
+
+    /// 空间回收只能在真正空闲的窗口做：VACUUM 期间写连接被独占，
+    /// 刚重建完就立刻跑会把正在看结果的人卡住。等 20 秒没有查询再动手。
+    private func scheduleMaintenance() {
+        maintenanceTask?.cancel()
+        maintenanceTask = Task { [weak self] in
+            guard let self else { return }
+            for _ in 0..<120 {
+                try? await Task.sleep(for: .seconds(5))
+                if Task.isCancelled { return }
+                guard self.phase == .ready, !self.isApplying, !self.isRebuilding,
+                      self.ftsTask == nil else { continue }
+                if let last = self.lastQueryAt,
+                   ContinuousClock.now - last < .seconds(20) {
+                    continue
+                }
+                do {
+                    let freed = try await self.database.reclaimSpaceIfNeeded()
+                    if freed > 0 {
+                        self.debugLog("reclaimed \(freed / 1_048_576)MB free pages")
+                    }
+                } catch {
+                    self.log.error("reclaim failed: \(error.localizedDescription, privacy: .public)")
+                }
+                return
+            }
+        }
+    }
+
+    // MARK: 正则
+
+    private static let regexCandidateCap = 20_000
+
+    /// 正则不经过 SQL：先用模式里最长的一段字面文本把候选压到几千条，
+    /// 再用 NSRegularExpression 精筛。没有字面锚点就直说，不拿全表去跑正则。
+    private func regexSearch(regex: FileSearchSyntax.RegexSpec,
+                             request: FileSearchRequest) async throws -> FileSearchResponse {
+        guard self.phase == .ready else { throw FileIndexError.databaseClosed }
+        lastQueryAt = ContinuousClock.now
+        let options: NSRegularExpression.Options = regex.caseInsensitive ? [.caseInsensitive] : []
+        guard let expression = try? NSRegularExpression(pattern: regex.pattern, options: options) else {
+            return FileSearchResponse(items: [], total: 0, isTruncated: false,
+                                      notice: L10n.Files.Notice.regexInvalid)
+        }
+        guard let literal = FileSearchRegex.literalAnchor(regex.pattern) else {
+            return FileSearchResponse(items: [], total: 0, isTruncated: false,
+                                      notice: L10n.Files.Notice.regexAnchor)
+        }
+        let query = FileIndexQuery(syntax: FileSearchSyntax(), category: request.category,
+                                   scope: request.scope, directories: request.directories,
+                                   sort: .name, limit: max(request.limit, 1))
+        let connection = await readConnection(for: .complete)
+        let candidates = try await connection.regexCandidates(
+            query, literal: literal, cap: Self.regexCandidateCap, usingFTS: isFTSReady)
+        let matched = candidates.filter { entry in
+            let range = NSRange(entry.name.startIndex..., in: entry.name)
+            return expression.firstMatch(in: entry.name, options: [], range: range) != nil
+        }
+        let limited = Array(matched.prefix(max(request.limit, 1)))
+        let items = makeItems(from: limited)
+        return FileSearchResponse(
+            items: items, total: matched.count,
+            isTruncated: matched.count > items.count || candidates.count >= Self.regexCandidateCap,
+            totalIsExact: candidates.count < Self.regexCandidateCap)
+    }
+
+    private func makeItems(from entries: [FileIndexEntry]) -> [FileItem] {
+        entries.map { entry in
+            FileItem(url: URL(fileURLWithPath: entry.path),
+                     isDirectory: entry.isDirectory,
+                     contentType: nil,
+                     contentTypeTree: entry.isDirectory ? ["public.folder"] : [],
+                     creationDate: entry.created,
+                     modificationDate: entry.modified,
+                     lastUsedDate: entry.lastUsed,
+                     fileSize: entry.size,
+                     origin: .index)
         }
     }
 
@@ -744,6 +868,8 @@ enum FileIndexMetaKey {
     static let completedAt = "full_scan_completed_at"
     static let rowCount = "full_scan_row_count"
     static let lastEventID = "last_event_id"
+    /// FTS 重建完成才写 1；整库交换/迁移会清空。
+    static let ftsReady = "fts_ready"
     /// 重扫开始就写、交换成功才删：还留着说明上一次重扫被打断在半路。
     static let rebuilding = "full_scan_in_progress"
 }

@@ -117,6 +117,44 @@ struct FileIndexScanResult: Sendable {
     let unreadable: Int
 }
 
+/// 扫描计数：多个 worker 并发累加，用锁而不是 actor，避免每批都多一次 await。
+private final class ScanCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var inserted = 0
+    private var unreadable = 0
+
+    func add(inserted count: Int = 0, unreadable: Int = 0) {
+        lock.lock()
+        self.inserted += count
+        self.unreadable += unreadable
+        lock.unlock()
+    }
+
+    var snapshot: (inserted: Int, unreadable: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (inserted, unreadable)
+    }
+}
+
+/// 待扫目录队列。四个 worker 从同一队列里领取：大目录不会被固定分给某一个 worker，
+/// 谁先空下来谁继续领，避免 `~/Library` 这种大树把某个线程拖到最后。
+private actor ScanQueue {
+    private let units: [URL]
+    private var index = 0
+
+    init(_ units: [URL]) {
+        self.units = units
+    }
+
+    func next() -> URL? {
+        guard index < units.count else { return nil }
+        let unit = units[index]
+        index += 1
+        return unit
+    }
+}
+
 enum FileIndexScanner {
     static let resourceKeys: Set<URLResourceKey> = [
         .isDirectoryKey, .isPackageKey, .isSymbolicLinkKey,
@@ -126,18 +164,18 @@ enum FileIndexScanner {
 
     /// 非隔离的递归扫描；只在批间 `await`，不会占住主线程。
     /// `staging: true` 时写暂存表，正式表要等调用方交换才更新——全量重扫靠这个保证中断不丢索引。
-    /// `batchPause` 给背后补扫用：每批之间让一下，把分钟级的磁盘与 CPU 抢占摊平（冷启不摊，那时没东西可服务）。
+    /// 顶层目录先切成扫描单元，四个 worker 并行遍历，写库仍由 `FileIndexDatabase` 串行化。
+    /// `batchPause` 给背后补扫用：每批之间让一下，把分钟级的磁盘与 CPU 抢占摊平
+    ///（冷启不摊，那时没东西可服务）。
     static func scan(roots: [URL], into db: FileIndexDatabase, policy: FileIndexPolicy,
                      staging: Bool = false, batchPause: Duration = .zero,
-                     progress: @Sendable (FileIndexScanProgress) async -> Void = { _ in })
+                     progress: @escaping @Sendable (FileIndexScanProgress) async -> Void = { _ in })
         async throws -> FileIndexScanResult {
         let fm = FileManager.default
-        var inserted = 0
-        var unreadable = 0
-        var batch: [FileIndexEntry] = []
+        var seeds: [FileIndexEntry] = []
+        var units: [URL] = []
         var kindCache: [String: String] = [:]
-        var lastReport = ContinuousClock.now
-        let reportInterval = Duration.milliseconds(220)
+        let counter = ScanCounter()
 
         for root in roots {
             if Task.isCancelled { throw CancellationError() }
@@ -148,78 +186,177 @@ enum FileIndexScanner {
             }
             guard fm.fileExists(atPath: rootURL.path) else { continue }
 
-            let rootEntry = entry(for: rootURL, isDirectory: true,
-                                  values: try? rootURL.resourceValues(forKeys: resourceKeys),
-                                  kindCache: &kindCache)
-            batch.append(rootEntry)
+            seeds.append(entry(for: rootURL, isDirectory: true,
+                               values: try? rootURL.resourceValues(forKeys: resourceKeys),
+                               kindCache: &kindCache))
+            // 只往下切两层：主目录的 Documents/Downloads/Library… 以及 Library 下的
+            // Mobile Documents 这类大枝先拆开，再深就变成大量极小的目录，调度开销反而更高。
+            collectUnits(at: rootURL, depth: 2, policy: policy, fm: fm,
+                         seeds: &seeds, units: &units,
+                         kindCache: &kindCache, counter: counter)
+            if Task.isCancelled { throw CancellationError() }
+        }
 
-            guard let enumerator = fm.enumerator(
-                at: rootURL,
-                includingPropertiesForKeys: Array(resourceKeys),
-                options: [.skipsPackageDescendants],
-                errorHandler: { _, _ in
-                    unreadable += 1
-                    return true
+        var inserted = 0
+        if !seeds.isEmpty {
+            try await write(seeds, into: db, staging: staging)
+            inserted = seeds.count
+            counter.add(inserted: inserted)
+        }
+
+        let queue = ScanQueue(units)
+        let width = max(1, min(4, ProcessInfo.processInfo.activeProcessorCount))
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for _ in 0..<width {
+                group.addTask {
+                    var localKinds: [String: String] = [:]
+                    while let unit = await queue.next() {
+                        try await scanUnit(unit, into: db, policy: policy, staging: staging,
+                                           batchPause: batchPause, counter: counter,
+                                           progress: progress, kindCache: &localKinds)
+                    }
                 }
-            ) else {
-                unreadable += 1
+            }
+            try await group.waitForAll()
+        }
+
+        let snapshot = counter.snapshot
+        await progress(FileIndexScanProgress(inserted: snapshot.inserted,
+                                             unreadable: snapshot.unreadable,
+                                             currentPath: nil))
+        return FileIndexScanResult(inserted: snapshot.inserted, unreadable: snapshot.unreadable)
+    }
+
+    /// 列出目录的直接子项：文件直接入种子，目录入种子后继续切；切到底的目录进扫描队列。
+    private static func collectUnits(at directory: URL, depth: Int, policy: FileIndexPolicy,
+                                     fm: FileManager,
+                                     seeds: inout [FileIndexEntry], units: inout [URL],
+                                     kindCache: inout [String: String], counter: ScanCounter) {
+        guard depth > 0 else {
+            units.append(directory)
+            return
+        }
+        guard let children = try? fm.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: Array(resourceKeys), options: []
+        ) else {
+            counter.add(unreadable: 1)
+            units.append(directory)
+            return
+        }
+        for child in children {
+            if Task.isCancelled { return }
+            if policy.shouldSkip(entry: child) { continue }
+            let values = try? child.resourceValues(forKeys: resourceKeys)
+            let isSymlink = values?.isSymbolicLink ?? false
+            let isDirectory = (values?.isDirectory ?? false) && !isSymlink
+            guard isDirectory else {
+                seeds.append(entry(for: child, isDirectory: false, values: values,
+                                   kindCache: &kindCache))
                 continue
             }
+            let name = child.lastPathComponent
+            if policy.shouldSkip(directory: child, name: name) { continue }
+            if values?.isPackage ?? false {
+                // 包本身可被搜到，但不展开内部结构。
+                seeds.append(entry(for: child, isDirectory: false, values: values,
+                                   kindCache: &kindCache))
+                continue
+            }
+            seeds.append(entry(for: child, isDirectory: true, values: values,
+                               kindCache: &kindCache))
+            if depth > 1 {
+                collectUnits(at: child, depth: depth - 1, policy: policy, fm: fm,
+                             seeds: &seeds, units: &units,
+                             kindCache: &kindCache, counter: counter)
+            } else {
+                units.append(child)
+            }
+        }
+    }
 
-            while let url = enumerator.nextObject() as? URL {
-                if Task.isCancelled { throw CancellationError() }
-                var skipSubtree = false
-                let entry: FileIndexEntry? = autoreleasepool {
-                    if policy.shouldSkip(entry: url) { return nil }
-                    let values = try? url.resourceValues(forKeys: resourceKeys)
-                    let name = url.lastPathComponent
-                    let isSymlink = values?.isSymbolicLink ?? false
-                    let isDirectory = (values?.isDirectory ?? false) && !isSymlink
-                    if isDirectory {
-                        if policy.shouldSkip(directory: url, name: name) {
-                            skipSubtree = true
-                            return nil
-                        }
-                        // 包（.app/.xcodeproj 等）本身可被搜到，但不展开内部结构。
-                        let isPackage = values?.isPackage ?? false
-                        if isPackage {
-                            skipSubtree = true
-                            return entry(for: url, isDirectory: false,
-                                         values: values, kindCache: &kindCache)
-                        }
+    private static func scanUnit(_ unit: URL, into db: FileIndexDatabase,
+                                 policy: FileIndexPolicy, staging: Bool,
+                                 batchPause: Duration, counter: ScanCounter,
+                                 progress: @escaping @Sendable (FileIndexScanProgress) async -> Void,
+                                 kindCache: inout [String: String]) async throws {
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(
+            at: unit,
+            includingPropertiesForKeys: Array(resourceKeys),
+            options: [.skipsPackageDescendants],
+            errorHandler: { _, _ in
+                counter.add(unreadable: 1)
+                return true
+            }
+        ) else {
+            counter.add(unreadable: 1)
+            return
+        }
+
+        var batch: [FileIndexEntry] = []
+        batch.reserveCapacity(1500)
+        var lastReport = ContinuousClock.now
+
+        while let url = enumerator.nextObject() as? URL {
+            if Task.isCancelled { throw CancellationError() }
+            var skipSubtree = false
+            let entry: FileIndexEntry? = autoreleasepool {
+                if policy.shouldSkip(entry: url) { return nil }
+                let values = try? url.resourceValues(forKeys: resourceKeys)
+                let name = url.lastPathComponent
+                let isSymlink = values?.isSymbolicLink ?? false
+                let isDirectory = (values?.isDirectory ?? false) && !isSymlink
+                if isDirectory {
+                    if policy.shouldSkip(directory: url, name: name) {
+                        skipSubtree = true
+                        return nil
                     }
-                    return entry(for: url, isDirectory: isDirectory,
-                                 values: values, kindCache: &kindCache)
+                    // 包（.app/.xcodeproj 等）本身可被搜到，但不展开内部结构。
+                    let isPackage = values?.isPackage ?? false
+                    if isPackage {
+                        skipSubtree = true
+                        return entry(for: url, isDirectory: false,
+                                     values: values, kindCache: &kindCache)
+                    }
                 }
-                if skipSubtree { enumerator.skipDescendants() }
-                if let entry { batch.append(entry) }
+                return entry(for: url, isDirectory: isDirectory,
+                             values: values, kindCache: &kindCache)
+            }
+            if skipSubtree { enumerator.skipDescendants() }
+            if let entry { batch.append(entry) }
 
-                if batch.count >= 1500 {
-                    let chunk = batch
-                    batch.removeAll(keepingCapacity: true)
-                    if staging { try await db.stage(chunk) } else { try await db.upsert(chunk) }
-                    inserted += chunk.count
-                    if batchPause > .zero { try? await Task.sleep(for: batchPause) }
-                    let now = ContinuousClock.now
-                    if now - lastReport >= reportInterval {
-                        lastReport = now
-                        await progress(FileIndexScanProgress(
-                            inserted: inserted, unreadable: unreadable,
-                            currentPath: url.path))
-                    }
+            if batch.count >= 1500 {
+                let chunk = batch
+                batch.removeAll(keepingCapacity: true)
+                try await write(chunk, into: db, staging: staging)
+                counter.add(inserted: chunk.count)
+                if batchPause > .zero { try? await Task.sleep(for: batchPause) }
+                let now = ContinuousClock.now
+                if now - lastReport >= .milliseconds(220) {
+                    lastReport = now
+                    let snapshot = counter.snapshot
+                    await progress(FileIndexScanProgress(inserted: snapshot.inserted,
+                                                         unreadable: snapshot.unreadable,
+                                                         currentPath: url.path))
                 }
             }
         }
 
         if !batch.isEmpty {
             let chunk = batch
-            batch.removeAll(keepingCapacity: true)
-            if staging { try await db.stage(chunk) } else { try await db.upsert(chunk) }
-            inserted += chunk.count
+            try await write(chunk, into: db, staging: staging)
+            counter.add(inserted: chunk.count)
         }
-        await progress(FileIndexScanProgress(inserted: inserted, unreadable: unreadable,
-                                             currentPath: nil))
-        return FileIndexScanResult(inserted: inserted, unreadable: unreadable)
+    }
+
+    private static func write(_ entries: [FileIndexEntry], into db: FileIndexDatabase,
+                              staging: Bool) async throws {
+        guard !entries.isEmpty else { return }
+        if staging {
+            try await db.stage(entries)
+        } else {
+            try await db.upsert(entries)
+        }
     }
 
     static func entry(for url: URL, isDirectory: Bool, values: URLResourceValues?,

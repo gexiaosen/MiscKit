@@ -581,7 +581,7 @@ struct FileIndexTests {
 
         // 交换之后索引仍跟着正式表：连续再来两轮，棵数不涨、名字两套轮流用
         var previous = try await db.liveIndexNames()
-        #expect(previous.count == 5)
+        #expect(previous.count == FileIndexDatabase.liveIndexCount)
         for round in 1...3 {
             try await db.beginStaging()
             try await db.stage([FileIndexEntry(
@@ -590,7 +590,7 @@ struct FileIndexTests {
             try await db.buildStagingIndexes()
             try await db.publishStaging(meta: [(FileIndexMetaKey.completedAt, "170000\(round)000")])
             let names = try await db.liveIndexNames()
-            #expect(names.count == 5, "第\(round)轮后索引=\(names.sorted())")
+            #expect(names.count == FileIndexDatabase.liveIndexCount, "第\(round)轮后索引=\(names.sorted())")
             #expect(names != previous, "第\(round)轮该换另一套名字")
             previous = names
         }

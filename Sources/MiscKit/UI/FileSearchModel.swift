@@ -10,7 +10,7 @@ final class FileSearchModel {
     private(set) var items: [FileItem] = []
     private(set) var total = 0
     private(set) var isTruncated = false
-    /// 索引给的总数被封顶时只作下界用，底栏说「1000+」而不是一个假精确值。
+    /// 索引给的总数被封顶时只作下界用，底栏说「300+」而不是一个假精确值。
     private(set) var totalIsExact = true
     private(set) var notice: String?
     /// 删除这类动作的结果另占一格：`notice` 每次查询都会被服务端覆盖，混进去就是一条闪没的提示。
@@ -416,7 +416,7 @@ final class FileSearchModel {
                 // body 已经把三段跑完且没到上限，total 就是精确值，不必再扫一遍计数。
                 if !body.isTruncated { return }
             } else {
-                // 补全段失败时不要继续拿计数去改底栏：列表还只是前缀，底栏说“1000+”
+                // 补全段失败时不要继续拿计数去改底栏：列表还只是前缀，底栏说“300+”
                 // 会让人以为包含段的结果已经进来了。保持快段的下界即可。
                 return
             }

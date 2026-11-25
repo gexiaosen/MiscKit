@@ -7,6 +7,10 @@ struct FileIndexEntry: Equatable, Sendable {
     let path: String
     let name: String
     let nameFolded: String
+    /// 汉字名的全拼（无声调、无空格）；非汉字名为空串。
+    let namePinyin: String
+    /// 汉字名的拼音首字母；非汉字名为空串。
+    let nameInitials: String
     let ext: String
     let kind: String
     let isDirectory: Bool
@@ -18,30 +22,44 @@ struct FileIndexEntry: Equatable, Sendable {
     init(path: String, name: String, isDirectory: Bool, ext: String, kind: String,
          size: Int64? = nil, modified: Date? = nil, created: Date? = nil,
          lastUsed: Date? = nil) {
+        let pinyin = FileIndexPinyin.make(name)
         self.init(path: path, name: name, nameFolded: FileIndexText.fold(name),
+                  namePinyin: pinyin.full, nameInitials: pinyin.initials,
                   isDirectory: isDirectory, ext: ext, kind: kind,
                   size: size, modified: modified, created: created, lastUsed: lastUsed)
     }
 
-    /// 从库里读出来的行已经存过 `name_folded`，别再跑一遍 ICU 折叠：一次查询 80 行，
-    /// 每行一次 `precomposedStringWithCanonicalMapping` + `folding` 是白扔的几十毫秒。
-    init(path: String, name: String, nameFolded: String, isDirectory: Bool, ext: String,
-         kind: String, size: Int64?, modified: Date?, created: Date?, lastUsed: Date?) {
+    init(path: String, name: String, nameFolded: String,
+         namePinyin: String = "", nameInitials: String = "",
+         isDirectory: Bool, ext: String, kind: String,
+         size: Int64?, modified: Date?, created: Date?, lastUsed: Date?) {
         self.path = path
         self.name = name
         self.nameFolded = nameFolded
+        self.namePinyin = namePinyin
+        self.nameInitials = nameInitials
+        self.isDirectory = isDirectory
         self.ext = ext
         self.kind = kind
-        self.isDirectory = isDirectory
         self.size = size
         self.modified = modified
         self.created = created
         self.lastUsed = lastUsed
     }
+
+    /// 从库里读出来的行已经存过各列折叠/转写结果，别再跑一遍 ICU 与拼音转换。
+    init(rowPath: String, name: String, nameFolded: String, pinyin: String,
+         initials: String, isDirectory: Bool, ext: String, kind: String,
+         size: Int64?, modified: Date?, created: Date?, lastUsed: Date?) {
+        self.init(path: rowPath, name: name, nameFolded: nameFolded,
+                  namePinyin: pinyin, nameInitials: initials,
+                  isDirectory: isDirectory, ext: ext, kind: kind,
+                  size: size, modified: modified, created: created, lastUsed: lastUsed)
+    }
 }
 
 /// 一次查询的产出。`total` 命中计数上限（见 `FileIndexDatabase.countCap`）时只是下界，
-/// 这时 `totalIsExact` 为假：宁可显示「1000+」，也不要为了一个精确数字再全表扫一遍。
+/// 这时 `totalIsExact` 为假：宁可显示「300+」，也不要为了一个精确数字再全表扫一遍。
 struct FileIndexQueryResult: Sendable {
     let entries: [FileIndexEntry]
     let total: Int
@@ -66,6 +84,8 @@ struct FileIndexQuery: Sendable {
     var directories: [URL]
     var sort: FileSort
     var limit: Int
+    /// 路径直达失败后的回退：只看完整路径，不只看文件名。
+    var pathSearch: Bool = false
 }
 
 enum FileIndexError: LocalizedError, Equatable {
@@ -178,12 +198,15 @@ actor FileIndexDatabase {
 
     // MARK: schema
 
+    /// 语义 v2：多出拼音列、去掉三张复合排序索引、新增 FTS5 trigram 表。
+    /// 版本不一致时整库重建——旧行没有拼音列，补也算不回来，只能重扫。
     private func migrate() throws {
         let version = try userVersion()
         if version != Self.schemaVersion {
             try execute("DROP TABLE IF EXISTS \(Self.liveTable)")
             try execute("DROP TABLE IF EXISTS \(Self.stagingTable)")
             try execute("DROP TABLE IF EXISTS \(Self.retiredTable)")
+            try execute("DROP TABLE IF EXISTS \(Self.ftsTable)")
             try execute("DROP TABLE IF EXISTS meta")
             try createSchema()
             try setUserVersion(Self.schemaVersion)
@@ -200,11 +223,16 @@ actor FileIndexDatabase {
             value TEXT NOT NULL
         )
         """)
+        try createFTS()
         try healIndexesIfDefinitionChanged()
     }
 
-    /// 索引定义换过版（单列 DESC → 与查询 ORDER BY 同式的复合表达式）就得整套换掉，
-    /// 光数"有没有 5 棵"是换不掉的。
+    private func createFTS() throws {
+        try execute(Self.ftsDefinition(Self.ftsTable))
+    }
+
+    /// 索引定义换过版（五索引 → 名称 + 修改时间两索引）就得整套换掉，
+    /// 光数"够不够"是换不掉的。
     private func healIndexesIfDefinitionChanged() throws {
         guard try meta(Self.indexDefinitionKey) != String(Self.indexDefinitionVersion) else {
             try ensureLiveIndexes()
@@ -224,6 +252,8 @@ actor FileIndexDatabase {
             path TEXT NOT NULL UNIQUE,
             name TEXT NOT NULL,
             name_folded TEXT NOT NULL,
+            name_pinyin TEXT NOT NULL DEFAULT '',
+            name_initials TEXT NOT NULL DEFAULT '',
             ext TEXT NOT NULL DEFAULT '',
             kind TEXT NOT NULL DEFAULT 'other',
             is_directory INTEGER NOT NULL DEFAULT 0,
@@ -280,23 +310,32 @@ actor FileIndexDatabase {
     private static let liveTable = "entries"
     private static let stagingTable = "entries_staging"
     private static let retiredTable = "entries_retired"
+    static let ftsTable = "name_fts"
     private static let indexDefinitionKey = "index_definition_version"
-    private static let indexDefinitionVersion = 2
+    private static let indexDefinitionVersion = 3
 
+    /// 只留两棵：名称（等值/前缀/名字序）与修改时间（默认的"最近"排序）。
+    /// 原先 created/size 各自再挂一棵带 name_folded 的复合索引，等于把名字又抄了两份，
+    /// 一百万行白占 110MB；非名字排序改为在候选集上排，候选集本来就只有几百条。
     private static let indexColumns = [
-        "name_folded", "kind",
-        // 表达式要和查询里的 ORDER BY 写成同一棵树，否则规划器不认，
-        // 排序只能全表扫 + TEMP B-TREE（实测 45ms 走索引后 0ms）。
+        "name_folded",
         "COALESCE(modified, 0) DESC, name_folded",
-        "COALESCE(created, 0) DESC, name_folded",
-        "COALESCE(size, 0) DESC, name_folded",
     ]
+    /// 供测试核对"两套名字轮流用、棵数不涨"。
+    nonisolated static var liveIndexCount: Int { indexColumns.count }
     private static let indexNameSets: [[String]] = [
-        ["idx_entries_name", "idx_entries_kind", "idx_entries_modified",
-         "idx_entries_created", "idx_entries_size"],
-        ["idx_stage_name", "idx_stage_kind", "idx_stage_modified",
-         "idx_stage_created", "idx_stage_size"],
+        ["idx_entries_name", "idx_entries_modified"],
+        ["idx_stage_name", "idx_stage_modified"],
     ]
+
+    private static func ftsDefinition(_ name: String) -> String {
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS \(name) USING fts5(
+            name, pinyin, initials,
+            content='', contentless_delete=1, tokenize='trigram'
+        )
+        """
+    }
 
     private func userVersion() throws -> Int32 {
         let statement = try prepare("PRAGMA user_version")
@@ -311,20 +350,38 @@ actor FileIndexDatabase {
 
     // MARK: 写入
 
-    func upsert(_ entries: [FileIndexEntry]) throws {
-        try apply(upserts: entries, into: Self.liveTable, deleting: [])
+    func upsert(_ entries: [FileIndexEntry], maintainFTS: Bool = false) throws {
+        try apply(upserts: entries, into: Self.liveTable, deleting: [], maintainFTS: maintainFTS)
     }
 
-    func apply(upserts: [FileIndexEntry], deleting deletes: [String]) throws {
-        try apply(upserts: upserts, into: Self.liveTable, deleting: deletes)
+    func apply(upserts: [FileIndexEntry], deleting deletes: [String],
+               maintainFTS: Bool = false) throws {
+        try apply(upserts: upserts, into: Self.liveTable, deleting: deletes,
+                  maintainFTS: maintainFTS)
     }
 
     private func apply(upserts: [FileIndexEntry], into table: String,
-                       deleting deletes: [String]) throws {
+                       deleting deletes: [String], maintainFTS: Bool) throws {
         guard !upserts.isEmpty || !deletes.isEmpty else { return }
         try execute("BEGIN IMMEDIATE")
         do {
             if !deletes.isEmpty {
+                if maintainFTS {
+                    // 先按旧 id 删 FTS，再删行：删完行就查不到 id 了。
+                    let statement = try prepare(
+                        "DELETE FROM \(Self.ftsTable) WHERE rowid IN ("
+                        + "SELECT id FROM \(table) WHERE path = ? OR (path >= ? AND path < ?))")
+                    defer { sqlite3_finalize(statement) }
+                    for path in deletes {
+                        let clean = Self.cleanPath(path)
+                        sqlite3_reset(statement)
+                        sqlite3_clear_bindings(statement)
+                        try bindText(clean, to: statement, at: 1)
+                        try bindText(clean + "/", to: statement, at: 2)
+                        try bindText(clean + "0", to: statement, at: 3)
+                        guard sqlite3_step(statement) == SQLITE_DONE else { throw currentError() }
+                    }
+                }
                 // 子树用 path 范围删除：能走 UNIQUE 索引，避免每条删除都全表扫一遍。
                 let statement = try prepare(
                     "DELETE FROM \(table) WHERE path = ? OR (path >= ? AND path < ?)")
@@ -341,13 +398,16 @@ actor FileIndexDatabase {
             }
 
             if !upserts.isEmpty {
+                // RETURNING 带回 id：FTS 的 rowid 必须和正式表一致。
                 let statement = try prepare("""
-                INSERT INTO \(table)(path, name, name_folded, ext, kind,
-                                     is_directory, size, modified, created, last_used)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO \(table)(path, name, name_folded, name_pinyin, name_initials,
+                                     ext, kind, is_directory, size, modified, created, last_used)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path) DO UPDATE SET
                     name = excluded.name,
                     name_folded = excluded.name_folded,
+                    name_pinyin = excluded.name_pinyin,
+                    name_initials = excluded.name_initials,
                     ext = excluded.ext,
                     kind = excluded.kind,
                     is_directory = excluded.is_directory,
@@ -355,38 +415,66 @@ actor FileIndexDatabase {
                     modified = excluded.modified,
                     created = excluded.created,
                     last_used = excluded.last_used
+                RETURNING id
                 """)
                 defer { sqlite3_finalize(statement) }
+                let ftsDelete = maintainFTS
+                    ? try prepare("DELETE FROM \(Self.ftsTable) WHERE rowid = ?") : nil
+                let ftsInsert = maintainFTS
+                    ? try prepare("INSERT INTO \(Self.ftsTable)(rowid, name, pinyin, initials)"
+                                  + " VALUES(?, ?, ?, ?)") : nil
+                defer {
+                    if let ftsDelete { sqlite3_finalize(ftsDelete) }
+                    if let ftsInsert { sqlite3_finalize(ftsInsert) }
+                }
                 for entry in upserts {
                     sqlite3_reset(statement)
                     sqlite3_clear_bindings(statement)
                     try bindText(entry.path, to: statement, at: 1)
                     try bindText(entry.name, to: statement, at: 2)
                     try bindText(entry.nameFolded, to: statement, at: 3)
-                    try bindText(entry.ext, to: statement, at: 4)
-                    try bindText(entry.kind, to: statement, at: 5)
-                    sqlite3_bind_int(statement, 6, entry.isDirectory ? 1 : 0)
+                    try bindText(entry.namePinyin, to: statement, at: 4)
+                    try bindText(entry.nameInitials, to: statement, at: 5)
+                    try bindText(entry.ext, to: statement, at: 6)
+                    try bindText(entry.kind, to: statement, at: 7)
+                    sqlite3_bind_int(statement, 8, entry.isDirectory ? 1 : 0)
                     if let size = entry.size {
-                        sqlite3_bind_int64(statement, 7, size)
-                    } else {
-                        sqlite3_bind_null(statement, 7)
-                    }
-                    if let modified = entry.modified {
-                        sqlite3_bind_double(statement, 8, modified.timeIntervalSince1970)
-                    } else {
-                        sqlite3_bind_null(statement, 8)
-                    }
-                    if let created = entry.created {
-                        sqlite3_bind_double(statement, 9, created.timeIntervalSince1970)
+                        sqlite3_bind_int64(statement, 9, size)
                     } else {
                         sqlite3_bind_null(statement, 9)
                     }
-                    if let lastUsed = entry.lastUsed {
-                        sqlite3_bind_double(statement, 10, lastUsed.timeIntervalSince1970)
+                    if let modified = entry.modified {
+                        sqlite3_bind_double(statement, 10, modified.timeIntervalSince1970)
                     } else {
                         sqlite3_bind_null(statement, 10)
                     }
-                    guard sqlite3_step(statement) == SQLITE_DONE else { throw currentError() }
+                    if let created = entry.created {
+                        sqlite3_bind_double(statement, 11, created.timeIntervalSince1970)
+                    } else {
+                        sqlite3_bind_null(statement, 11)
+                    }
+                    if let lastUsed = entry.lastUsed {
+                        sqlite3_bind_double(statement, 12, lastUsed.timeIntervalSince1970)
+                    } else {
+                        sqlite3_bind_null(statement, 12)
+                    }
+                    guard sqlite3_step(statement) == SQLITE_ROW else { throw currentError() }
+                    let id = sqlite3_column_int64(statement, 0)
+                    if let ftsDelete {
+                        sqlite3_reset(ftsDelete)
+                        sqlite3_clear_bindings(ftsDelete)
+                        sqlite3_bind_int64(ftsDelete, 1, id)
+                        guard sqlite3_step(ftsDelete) == SQLITE_DONE else { throw currentError() }
+                    }
+                    if let ftsInsert {
+                        sqlite3_reset(ftsInsert)
+                        sqlite3_clear_bindings(ftsInsert)
+                        sqlite3_bind_int64(ftsInsert, 1, id)
+                        try bindText(entry.nameFolded, to: ftsInsert, at: 2)
+                        try bindText(entry.namePinyin, to: ftsInsert, at: 3)
+                        try bindText(entry.nameInitials, to: ftsInsert, at: 4)
+                        guard sqlite3_step(ftsInsert) == SQLITE_DONE else { throw currentError() }
+                    }
                 }
             }
             try execute("COMMIT")
@@ -396,8 +484,8 @@ actor FileIndexDatabase {
         }
     }
 
-    func deleteSubtree(_ path: String) throws {
-        try apply(upserts: [], deleting: [path])
+    func deleteSubtree(_ path: String, maintainFTS: Bool = false) throws {
+        try apply(upserts: [], into: Self.liveTable, deleting: [path], maintainFTS: maintainFTS)
     }
 
     // MARK: 全量重扫的暂存与交换
@@ -410,10 +498,10 @@ actor FileIndexDatabase {
     }
 
     func stage(_ entries: [FileIndexEntry]) throws {
-        try apply(upserts: entries, into: Self.stagingTable, deleting: [])
+        try apply(upserts: entries, into: Self.stagingTable, deleting: [], maintainFTS: false)
     }
 
-    /// 交换之前：把 5 棵索引先在暂存表上建好。这 0.6 秒里正式表照常供查询，
+    /// 交换之前：索引先在暂存表上建好。这 0.6 秒里正式表照常供查询，
     /// 交换事务就只剩两次改名——不再有"每次重扫结尾硬顿一下"。
     func buildStagingIndexes() throws {
         try execute("DROP TABLE IF EXISTS \(Self.retiredTable)")
@@ -425,6 +513,8 @@ actor FileIndexDatabase {
     }
 
     /// 一次事务里改名 + 落元数据：提交前崩溃 = 旧索引一字未动。
+    /// FTS 表在这里清空并标记未就绪：行 id 已经换了一整套，旧 FTS 记录会指向别的文件；
+    /// 重建由 FileIndex 在后台补，补完之前包含段回退到 `instr`。
     func publishStaging(meta updates: [(key: String, value: String?)]) throws {
         let staged = try scalarInt(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -436,12 +526,15 @@ actor FileIndexDatabase {
             try execute("ALTER TABLE \(Self.stagingTable) RENAME TO \(Self.liveTable)")
             // 旧表连同它那套索引名一起退场：下一轮暂存表才建得同名索引。
             try execute("DROP TABLE IF EXISTS \(Self.retiredTable)")
+            try execute("DROP TABLE IF EXISTS \(Self.ftsTable)")
+            try createFTS()
             // 索引本该在交换前就建在暂存表上（跟着改名一起过来）；真缺了这里补上，
             // 别让正式表裸奔到下一次重扫。
             try ensureLiveIndexes()
             for update in updates {
                 try setMeta(update.key, value: update.value)
             }
+            try setMeta(FileIndexMetaKey.ftsReady, value: nil)
             try execute("COMMIT")
         } catch {
             try? execute("ROLLBACK")
@@ -450,12 +543,17 @@ actor FileIndexDatabase {
     }
 
     /// 旧表腾出的页留在文件里，攒多了整理一次，别把磁盘越用越大。
-    /// VACUUM 期间这条连接什么都干不了，所以只在本来就没在服务查询的时候做。
-    func reclaimSpaceIfNeeded() throws {
+    /// VACUUM 期间这条连接什么都干不了，所以只由 FileIndex 在空闲窗口调用。
+    func reclaimSpaceIfNeeded(minimumFreeBytes: Int64 = 96 * 1024 * 1024) throws -> Int64 {
         let freePages = try scalarInt("PRAGMA freelist_count", values: [])
         let pageSize = try scalarInt("PRAGMA page_size", values: [])
-        guard freePages * pageSize > 64 * 1024 * 1024 else { return }
+        let freeBytes = Int64(freePages) * Int64(pageSize)
+        guard freeBytes > minimumFreeBytes else { return 0 }
+        // checkpoint 只是顺手缩小 WAL；读连接恰好在读时会 BUSY，别让它挡住 VACUUM。
+        try? execute("PRAGMA wal_checkpoint(TRUNCATE)")
         try execute("VACUUM")
+        try? execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return freeBytes
     }
 
     // MARK: 子树重扫的暂存与交换
@@ -467,25 +565,70 @@ actor FileIndexDatabase {
         try createEntriesTable(Self.stagingTable)
     }
 
-    func publishStagingSubtree(_ path: String) throws {
+    func publishStagingSubtree(_ path: String, maintainFTS: Bool = false) throws {
         let clean = Self.cleanPath(path)
         try execute("BEGIN IMMEDIATE")
         do {
+            if maintainFTS {
+                try execute("""
+                DELETE FROM \(Self.ftsTable) WHERE rowid IN (
+                    SELECT id FROM \(Self.liveTable)
+                    WHERE path = ? OR (path >= ? AND path < ?))
+                """, values: [clean, clean + "/", clean + "0"])
+            }
             try execute("DELETE FROM \(Self.liveTable) WHERE path = ? OR (path >= ? AND path < ?)",
                         values: [clean, clean + "/", clean + "0"])
             try execute("""
-            INSERT INTO \(Self.liveTable)(path, name, name_folded, ext, kind,
-                                          is_directory, size, modified, created, last_used)
-            SELECT path, name, name_folded, ext, kind,
-                   is_directory, size, modified, created, last_used
+            INSERT INTO \(Self.liveTable)(path, name, name_folded, name_pinyin, name_initials,
+                                          ext, kind, is_directory, size, modified, created, last_used)
+            SELECT path, name, name_folded, name_pinyin, name_initials,
+                   ext, kind, is_directory, size, modified, created, last_used
             FROM \(Self.stagingTable)
             """)
+            if maintainFTS {
+                try execute("""
+                INSERT INTO \(Self.ftsTable)(rowid, name, pinyin, initials)
+                SELECT id, name_folded, name_pinyin, name_initials FROM \(Self.liveTable)
+                WHERE path = ? OR (path >= ? AND path < ?)
+                """, values: [clean, clean + "/", clean + "0"])
+            }
             try execute("DROP TABLE \(Self.stagingTable)")
             try execute("COMMIT")
         } catch {
             try? execute("ROLLBACK")
             throw error
         }
+    }
+
+    // MARK: FTS 重建
+
+    /// 全量重建 FTS。分块插入，避免一次事务把 WAL 撑到几百 MB；
+    /// 中途被取消/崩溃时 `fts_ready` 仍为空，下次启动会从头重建。
+    func rebuildFTS() throws {
+        try setMeta(FileIndexMetaKey.ftsReady, value: nil)
+        try execute("DELETE FROM \(Self.ftsTable)")
+        let maxID = try scalarInt("SELECT COALESCE(MAX(id), 0) FROM \(Self.liveTable)", values: [])
+        var cursor = 0
+        let chunk = 20_000
+        while cursor < maxID {
+            let upper = cursor + chunk
+            try execute("""
+            INSERT INTO \(Self.ftsTable)(rowid, name, pinyin, initials)
+            SELECT id, name_folded, name_pinyin, name_initials FROM \(Self.liveTable)
+            WHERE id > \(cursor) AND id <= \(upper)
+            """)
+            cursor = upper
+        }
+        try setMeta(FileIndexMetaKey.ftsReady, value: "1")
+    }
+
+    /// 增量维护后 FTS 与正式表的行数应当一致；不一致说明有事务外的写入或上次重建没跑完。
+    func ftsRowCount() throws -> Int {
+        try scalarInt("SELECT COUNT(*) FROM \(Self.ftsTable)", values: [])
+    }
+
+    func markFTSReady(_ ready: Bool) throws {
+        try setMeta(FileIndexMetaKey.ftsReady, value: ready ? "1" : nil)
     }
 
     private func execute(_ sql: String, values: [String]) throws {
@@ -536,9 +679,8 @@ actor FileIndexDatabase {
     // MARK: 查询
 
     /// 命中计数的上限：超过它就只报「这么多」而不追求精确。
-    /// 一个 38 万行的库上，精确总数意味着每次按键都要多扫一遍全表，
-    /// 而用户真正需要的信息只是「还有很多，先给你 80 条」。
-    nonisolated static let countCap = 1000
+    /// 与 UI 单次展示的 300 行对齐：再往上多数一个数字，用户也翻不到第 301 条。
+    nonisolated static let countCap = 300
 
     /// 查询计划分成三类子句：基础过滤（类型/范围/扩展名）、词过滤、排序。
     /// `whereSQL` 与 `values` 必须按 append 顺序成对使用。
@@ -559,13 +701,11 @@ actor FileIndexDatabase {
         }
     }
 
-    func query(_ query: FileIndexQuery) throws -> FileIndexQueryResult {
-        try self.query(query, phase: .complete)
-    }
-
     /// `phase == .complete` 保持原有的一次性语义，测试和兜底路径用它；
     /// 主搜索走 `.fast` → `.body` → `.count`，慢段不再挡首屏。
-    func query(_ query: FileIndexQuery, phase: FileIndexQueryPhase) throws -> FileIndexQueryResult {
+    /// `usingFTS` 由 `FileIndex` 给出：读写两条连接对 FTS 是否就绪必须看同一个事实。
+    func query(_ query: FileIndexQuery, phase: FileIndexQueryPhase = .complete,
+               usingFTS: Bool = false) throws -> FileIndexQueryResult {
         let interruptible = phase == .body || phase == .count
         if interruptible { storeInterruptibleQueryRunning(true) }
         defer {
@@ -574,42 +714,49 @@ actor FileIndexDatabase {
 
         let limit = max(query.limit, 0)
         let base = baseFilter(query)
-        let rankingIndex = query.syntax.terms.firstIndex { !$0.isNegated }
+        let rankingIndex = query.syntax.terms.firstIndex {
+            !$0.isNegated && $0.kind == .substring && !$0.text.isEmpty
+        }
 
         if phase == .count {
-            let count = try cappedCount(fullFilter(query))
+            let count = try cappedCount(fullFilter(query, usingFTS: usingFTS))
             return FileIndexQueryResult(entries: [], total: count.count,
                                         totalIsExact: count.exact, exhausted: true)
         }
 
         guard limit > 0 else {
-            let count = try cappedCount(fullFilter(query))
+            let count = try cappedCount(fullFilter(query, usingFTS: usingFTS))
             return FileIndexQueryResult(entries: [], total: count.count,
                                         totalIsExact: count.exact, exhausted: true)
         }
 
         // 相关度排序走「分段取」：完全相等 → 前缀 → 其余，三段合起来正好覆盖全部命中，
-        // 段内按名字序。前两段顺着 `name_folded` 索引区间走，第三段才扫包含；
+        // 段内按名字序。前两段顺着 `name_folded` 索引区间走，第三段走 FTS；
         // `.fast` 只跑前两段，命中够了就停。
         if query.sort == .relevance,
+           !query.pathSearch, !query.syntax.pathOnly,
            let rankingIndex,
-           !query.syntax.terms[rankingIndex].text.isEmpty,
-           !query.syntax.terms[rankingIndex].hasWildcard {
+           !query.syntax.terms[rankingIndex].hasWildcard,
+           query.syntax.terms[rankingIndex].kind == .substring {
             return try queryRanking(query, base: base, rankingIndex: rankingIndex,
-                                    limit: limit, phase: phase)
+                                    limit: limit, phase: phase, usingFTS: usingFTS)
         }
 
-        return try queryOrdered(query, base: base, limit: limit, phase: phase)
+        return try queryOrdered(query, base: base, limit: limit, phase: phase,
+                                usingFTS: usingFTS)
     }
 
     private func queryRanking(_ query: FileIndexQuery, base: Filter, rankingIndex: Int,
-                              limit: Int, phase: FileIndexQueryPhase) throws -> FileIndexQueryResult {
+                              limit: Int, phase: FileIndexQueryPhase,
+                              usingFTS: Bool) throws -> FileIndexQueryResult {
         let folded = FileIndexText.fold(query.syntax.terms[rankingIndex].text)
-        let rest = termFilter(query, skipping: rankingIndex)
+        let rest = termFilter(query, skipping: rankingIndex, usingFTS: usingFTS)
+        let groups = Self.rankingGroups(folded: folded, phase: phase,
+                                        ftsQuery: usingFTS ? ftsMatch(folded) : nil)
         var seen = Set<String>()
         var collected: [FileIndexEntry] = []
         var overflow = false
-        for group in Self.rankingGroups(folded: folded, phase: phase) {
+        for group in groups {
             if collected.count > limit { break }
             var filter = base
             filter.merge(rest)
@@ -624,12 +771,14 @@ actor FileIndexDatabase {
         // `.fast` 只跑了前两段，包含段还没扫，不能宣称“到底了”；
         // `.body` 三段都跑过，收集数没超过上限才算到底。
         let exhausted = phase == .fast ? false : (!overflow && collected.count <= limit)
-        return try makeResult(collected, limit: limit, filter: fullFilter(query),
+        return try makeResult(collected, limit: limit,
+                              filter: fullFilter(query, usingFTS: usingFTS),
                               exhausted: exhausted, phase: phase)
     }
 
     private func queryOrdered(_ query: FileIndexQuery, base: Filter,
-                              limit: Int, phase: FileIndexQueryPhase) throws -> FileIndexQueryResult {
+                              limit: Int, phase: FileIndexQueryPhase,
+                              usingFTS: Bool) throws -> FileIndexQueryResult {
         let order: String
         switch query.sort {
         case .relevance, .name:
@@ -643,22 +792,31 @@ actor FileIndexDatabase {
             order = "COALESCE(size, 0) DESC, name_folded ASC, id ASC"
         }
         var filter = base
-        filter.merge(termFilter(query, skipping: nil))
+        filter.merge(termFilter(query, skipping: nil, usingFTS: usingFTS))
         let rows = try select(filter, order: order, limit: limit + 1)
         let exhausted = rows.count <= limit
-        return try makeResult(rows, limit: limit, filter: fullFilter(query),
+        return try makeResult(rows, limit: limit,
+                              filter: fullFilter(query, usingFTS: usingFTS),
                               exhausted: exhausted, phase: phase)
     }
 
     /// 三段排序子句：`name_folded` 上的等值、前缀、包含。
     /// 前缀改用 `GLOB`：`LIKE 'x%' ESCAPE` 在 SQLite 里会退化成全索引 `SCAN`，
     /// `GLOB` 才能让规划器走 `name_folded` 的区间；含 `[` / `]` 的名字由 `globPrefix` 转义。
-    private static func rankingGroups(folded: String,
-                                      phase: FileIndexQueryPhase) -> [(clause: String, values: [SQLValue])] {
+    /// 包含段有 FTS 时换成 `id IN (SELECT rowid … MATCH ?)`：只取命中 id，再按名字索引回表。
+    private static func rankingGroups(folded: String, phase: FileIndexQueryPhase,
+                                      ftsQuery: String?) -> [(clause: String, values: [SQLValue])] {
+        let contains: (String, [SQLValue])
+        if let ftsQuery {
+            contains = ("id IN (SELECT rowid FROM \(Self.ftsTable) WHERE \(Self.ftsTable) MATCH ?)",
+                        [.text(ftsQuery)])
+        } else {
+            contains = ("instr(name_folded, ?) > 0", [.text(folded)])
+        }
         let groups: [(clause: String, values: [SQLValue])] = [
             ("name_folded = ?", [.text(folded)]),
             ("name_folded GLOB ?", [.text(FileIndexText.globPrefix(folded))]),
-            ("instr(name_folded, ?) > 0", [.text(folded)]),
+            contains,
         ]
         return phase == .fast ? Array(groups.prefix(2)) : groups
     }
@@ -682,7 +840,7 @@ actor FileIndexDatabase {
                                     totalIsExact: count.exact, exhausted: false)
     }
 
-    /// 分类 / 范围 / `folder:` `file:` / `ext:` 这些与词无关的过滤。
+    /// 分类 / 范围 / `in:` / `folder:` `file:` / `ext:` 这些与词无关的过滤。
     private func baseFilter(_ query: FileIndexQuery) -> Filter {
         var filter = Filter()
         if query.syntax.folderOnly { filter.append("is_directory = 1") }
@@ -708,53 +866,122 @@ actor FileIndexDatabase {
                 ? [FileManager.default.homeDirectoryForCurrentUser]
                 : query.directories
             var scopes: [String] = []
-            var values: [SQLValue] = []
+            var values: [String] = []
             for directory in directories {
                 let path = Self.cleanPath(directory.path)
                 // 子树判定用 path 区间而不是 LIKE：`path` 上有 UNIQUE 索引，
                 // 区间能顺着索引走，LIKE 'x/%' 只能逐行比对。
                 scopes.append("(path = ? OR (path >= ? AND path < ?))")
-                values.append(.text(path))
-                values.append(.text(path + "/"))
-                values.append(.text(path + "0"))
+                values.append(path)
+                values.append(path + "/")
+                values.append(path + "0")
             }
-            filter.append("(" + scopes.joined(separator: " OR ") + ")", values)
+            filter.append("(" + scopes.joined(separator: " OR ") + ")",
+                          values.map { SQLValue.text($0) })
+        }
+
+        // `in:~/Downloads` / `in:"/Volumes/Work"`：目录限定，多个取并集。
+        if !query.syntax.scopes.isEmpty {
+            var clauses: [String] = []
+            var values: [String] = []
+            for raw in query.syntax.scopes {
+                guard let url = Self.resolveScope(raw) else { continue }
+                let path = Self.cleanPath(url.path)
+                clauses.append("(path = ? OR (path >= ? AND path < ?))")
+                values.append(path)
+                values.append(path + "/")
+                values.append(path + "0")
+            }
+            if !clauses.isEmpty {
+                filter.append("(" + clauses.joined(separator: " OR ") + ")",
+                              values.map { SQLValue.text($0) })
+            }
         }
         return filter
     }
 
     /// 全部词的过滤；`skipping` 用于分段取时把排序那一个词换成段子句。
-    /// 不含通配符的词用 `instr` 做字面包含，不再拼 `%...%` 让 LIKE 逐行解析；
-    /// 通配词仍走 LIKE，因为 `?` / `*` 要保留模式语义。
-    private func termFilter(_ query: FileIndexQuery, skipping: Int?) -> Filter {
+    private func termFilter(_ query: FileIndexQuery, skipping: Int?,
+                            usingFTS: Bool) -> Filter {
         var filter = Filter()
         for (index, term) in query.syntax.terms.enumerated() where index != skipping {
-            if term.hasWildcard {
-                let pattern = FileSearchSyntax.likePattern(for: term)
-                filter.append(term.isNegated
-                    ? "name_folded NOT LIKE ? ESCAPE '\\'"
-                    : "name_folded LIKE ? ESCAPE '\\'",
-                    [.text(pattern)])
-            } else {
-                let needle = FileIndexText.fold(term.text)
-                filter.append(term.isNegated
-                    ? "instr(name_folded, ?) = 0"
-                    : "instr(name_folded, ?) > 0",
-                    [.text(needle)])
+            if term.isNegated {
+                let folded = FileIndexText.fold(term.text)
+                if term.kind == .wildcard {
+                    filter.append("name_folded NOT LIKE ? ESCAPE '\\'",
+                                  [.text(FileSearchSyntax.likePattern(for: term))])
+                } else {
+                    filter.append("instr(name_folded, ?) = 0", [.text(folded)])
+                }
+                continue
             }
+            if term.kind == .wildcard {
+                filter.append("name_folded LIKE ? ESCAPE '\\'",
+                              [.text(FileSearchSyntax.likePattern(for: term))])
+                continue
+            }
+            if term.kind == .fuzzy {
+                // 子序列匹配没法走索引；这是显式 `~` 模式，接受一次全表扫描。
+                filter.append("name_folded LIKE ? ESCAPE '\\'",
+                              [.text(FileSearchSyntax.fuzzyPattern(for: term))])
+                continue
+            }
+            let folded = FileIndexText.fold(term.text)
+            if query.pathSearch || query.syntax.pathOnly {
+                // 路径回退/显式 path: 只看完整路径。LIKE 的 ASCII 大小写不敏感，
+                // 折叠后的查询词可直接用；CJK 本来就大小写无关。
+                filter.append("path LIKE ? ESCAPE '\\'",
+                              [.text("%" + FileIndexText.escapeLike(folded) + "%")])
+                continue
+            }
+            // 2 个字符的短词 FTS trigram 给不出结果（会静默变成 0 条），必须回退 instr。
+            if usingFTS, folded.count >= 3, let ftsQuery = ftsMatch(folded) {
+                filter.append("id IN (SELECT rowid FROM \(Self.ftsTable) WHERE \(Self.ftsTable) MATCH ?)",
+                              [.text(ftsQuery)])
+                continue
+            }
+            filter.append("instr(name_folded, ?) > 0", [.text(folded)])
         }
         return filter
     }
 
-    private func fullFilter(_ query: FileIndexQuery) -> Filter {
+    /// 文件名的 FTS 查询串：ASCII 词同时命中拼音全拼与首字母。
+    private func ftsMatch(_ folded: String) -> String? {
+        guard folded.count >= 3 else { return nil }
+        let escaped = folded.replacingOccurrences(of: "\"", with: "\"\"")
+        let isASCIIWord = folded.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber) }
+        if isASCIIWord {
+            return "name:\"\(escaped)\" OR initials:\"\(escaped)\" OR pinyin:\"\(escaped)\""
+        }
+        return "name:\"\(escaped)\""
+    }
+
+    private func fullFilter(_ query: FileIndexQuery, usingFTS: Bool) -> Filter {
         var filter = baseFilter(query)
-        filter.merge(termFilter(query, skipping: nil))
+        filter.merge(termFilter(query, skipping: nil, usingFTS: usingFTS))
         return filter
+    }
+
+    /// 正则模式的候选集预筛：用模式里最长的一段字面文本走 FTS/instr，
+    /// 再把候选交给调用方用 NSRegularExpression 精筛。没有字面锚点时返回 nil。
+    func regexCandidates(_ query: FileIndexQuery, literal: String,
+                         cap: Int, usingFTS: Bool) throws -> [FileIndexEntry] {
+        var filter = baseFilter(query)
+        let folded = FileIndexText.fold(literal)
+        if usingFTS, folded.count >= 3 {
+            let escaped = folded.replacingOccurrences(of: "\"", with: "\"\"")
+            filter.append("id IN (SELECT rowid FROM \(Self.ftsTable) WHERE \(Self.ftsTable) MATCH ?)",
+                          [.text("name:\"\(escaped)\"")])
+        } else {
+            filter.append("instr(name_folded, ?) > 0", [.text(folded)])
+        }
+        return try select(filter, order: "name_folded ASC, id ASC", limit: cap)
     }
 
     private func select(_ filter: Filter, order: String, limit: Int) throws -> [FileIndexEntry] {
         let sql = """
-        SELECT path, name, name_folded, is_directory, ext, kind, size, modified, created, last_used
+        SELECT path, name, name_folded, name_pinyin, name_initials, is_directory,
+               ext, kind, size, modified, created, last_used
         FROM \(Self.liveTable)
         WHERE \(filter.whereSQL)
         ORDER BY \(order)
@@ -777,7 +1004,7 @@ actor FileIndexDatabase {
         return entries
     }
 
-    /// 数命中，但最多数到 `countCap + 1` 就停：索引扫到第 1001 个命中即收手。
+    /// 数命中，但最多数到 `countCap + 1` 就停：索引扫到第 301 个命中即收手。
     private func cappedCount(_ filter: Filter) throws -> (count: Int, exact: Bool) {
         let sql = """
         SELECT COUNT(*) FROM (
@@ -798,20 +1025,22 @@ actor FileIndexDatabase {
     }
 
     private func entryFromRow(_ statement: OpaquePointer) -> FileIndexEntry {
-        let size = sqlite3_column_type(statement, 6) == SQLITE_NULL
-            ? nil : sqlite3_column_int64(statement, 6)
-        let modified = sqlite3_column_type(statement, 7) == SQLITE_NULL
-            ? nil : Date(timeIntervalSince1970: sqlite3_column_double(statement, 7))
-        let created = sqlite3_column_type(statement, 8) == SQLITE_NULL
-            ? nil : Date(timeIntervalSince1970: sqlite3_column_double(statement, 8))
-        let lastUsed = sqlite3_column_type(statement, 9) == SQLITE_NULL
+        let size = sqlite3_column_type(statement, 8) == SQLITE_NULL
+            ? nil : sqlite3_column_int64(statement, 8)
+        let modified = sqlite3_column_type(statement, 9) == SQLITE_NULL
             ? nil : Date(timeIntervalSince1970: sqlite3_column_double(statement, 9))
-        return FileIndexEntry(path: columnText(statement, 0),
+        let created = sqlite3_column_type(statement, 10) == SQLITE_NULL
+            ? nil : Date(timeIntervalSince1970: sqlite3_column_double(statement, 10))
+        let lastUsed = sqlite3_column_type(statement, 11) == SQLITE_NULL
+            ? nil : Date(timeIntervalSince1970: sqlite3_column_double(statement, 11))
+        return FileIndexEntry(rowPath: columnText(statement, 0),
                               name: columnText(statement, 1),
                               nameFolded: columnText(statement, 2),
-                              isDirectory: sqlite3_column_int(statement, 3) != 0,
-                              ext: columnText(statement, 4),
-                              kind: columnText(statement, 5),
+                              pinyin: columnText(statement, 3),
+                              initials: columnText(statement, 4),
+                              isDirectory: sqlite3_column_int(statement, 5) != 0,
+                              ext: columnText(statement, 6),
+                              kind: columnText(statement, 7),
                               size: size, modified: modified,
                               created: created, lastUsed: lastUsed)
     }
@@ -887,7 +1116,23 @@ actor FileIndexDatabase {
         return clean.count > 1 && clean.hasSuffix("/") ? String(clean.dropLast()) : clean
     }
 
-    private static let schemaVersion: Int32 = 1
+    /// `in:` / `path:` 里的作用域写法：`~/x`、`x`（相对主目录）、`/abs`。
+    static func resolveScope(_ raw: String) -> URL? {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        value = value.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+        guard !value.isEmpty else { return nil }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        if value == "~" { return home }
+        if value.hasPrefix("~/") {
+            return home.appendingPathComponent(String(value.dropFirst(2)))
+        }
+        if value.hasPrefix("/") {
+            return URL(fileURLWithPath: value)
+        }
+        return home.appendingPathComponent(value)
+    }
+
+    private static let schemaVersion: Int32 = 2
 }
 
 nonisolated(unsafe) private let fileIndexSQLiteTransient =

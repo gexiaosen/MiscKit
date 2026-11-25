@@ -10930,6 +10930,57 @@
           }
         }
       }
+    },
+    "files.notice.regexAnchor": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Regex needs a literal run of at least 2 characters"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正则模式需要至少 2 个字符的字面片段"
+          }
+        }
+      }
+    },
+    "files.notice.regexInvalid": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Invalid regex pattern"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正则表达式无效"
+          }
+        }
+      }
+    },
+    "files.notice.regexUnavailable": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Regex search needs the file index, which is still preparing"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正则搜索需要文件索引，索引尚未就绪"
+          }
+        }
+      }
     }
   },
   "version": "1.0"
